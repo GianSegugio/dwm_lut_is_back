@@ -1,4 +1,4 @@
-﻿<Window x:Class="DwmLutGUI.AboutWindow"
+<Window x:Class="DwmLutGUI.AboutWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
@@ -8,15 +8,19 @@
         SizeToContent="WidthAndHeight"
         ResizeMode="NoResize"
         WindowStartupLocation="CenterOwner"
-        SnapsToDevicePixels="True">
+        SnapsToDevicePixels="True"
+        Background="{StaticResource BackgroundBrush}">
     <StackPanel Margin="6">
+        <TextBlock FontSize="15" FontWeight="Bold" HorizontalAlignment="Center" TextAlignment="Center">
+            DwmLut Is Back by mattaja
+        </TextBlock>
         <TextBlock FontSize="15" HorizontalAlignment="Center" TextAlignment="Center">
-            dwm_lut v3.9.6 by lauralex (original by ledoge)
+            original project by ledoge, <LineBreak />contributions by lauralex and ed1ii<LineBreak />
         </TextBlock>
         <TextBlock HorizontalAlignment="Center" TextAlignment="Center">
             Licensed under GPLv3 <LineBreak /> <LineBreak />
             Source code and releases hosted at <LineBreak />
-            <Hyperlink RequestNavigate="OnRequestNavigate" NavigateUri="https://github.com/lauralex/dwm_lut">https://github.com/lauralex/dwm_lut</Hyperlink>
+            <Hyperlink RequestNavigate="OnRequestNavigate" NavigateUri="https://github.com/GianSegugio/dwm_lut_is_back">https://github.com/GianSegugio/dwm_lut_is_back</Hyperlink>
         </TextBlock>
     </StackPanel>
 </Window>

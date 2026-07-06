@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
@@ -20,6 +20,7 @@ namespace DwmLutGUI
         private MonitorData _selectedMonitor;
         private bool _isActive;
         private Key _toggleKey;
+        private bool _autostartAsked;
 
         private readonly string _configPath;
 
@@ -49,7 +50,7 @@ namespace DwmLutGUI
         {
             OnPropertyChanged(nameof(SdrLutPath));
             OnPropertyChanged(nameof(HdrLutPath));
-            SaveConfig();
+            if (!_updatingMonitors) SaveConfig();   // never persist a half-rebuilt list (see flag)
         }
 
         public string ActiveText
@@ -86,19 +87,40 @@ namespace DwmLutGUI
             if (_allMonitors.Count == 0)
                 return;
 
-            var xElem = new XElement("monitors",
-                new XAttribute("lut_toggle", _toggleKey),
-                _allMonitors.Select(x =>
-                    new XElement("monitor", new XAttribute("path", x.DevicePath),
-                        x.SdrLutPath != null ? new XAttribute("sdr_lut", x.SdrLutPath) : null,
-                        x.HdrLutPath != null ? new XAttribute("hdr_lut", x.HdrLutPath) : null,
-                        x.SdrLuts != null ? new XElement("sdr_luts", x.SdrLuts.Select(s => new XElement("sdr_lut", s))) : null)));
+            try
+            {
+                var xElem = new XElement("monitors",
+                    new XAttribute("lut_toggle", _toggleKey),
+                    new XAttribute("autostart_asked", _autostartAsked),
+                    _allMonitors
+                        // an entry with no usable identity can never be matched back and would only
+                        // serve to poison the writer; drop it defensively.
+                        .Where(x => !string.IsNullOrEmpty(x.DevicePath) || !string.IsNullOrEmpty(x.Name))
+                        .Select(x =>
+                            new XElement("monitor",
+                                // Coalesce EVERY value: XAttribute(name, null) throws
+                                // "ArgumentNullException: Value cannot be null. Parameter name: value".
+                                new XAttribute("path", x.DevicePath ?? ""),
+                                new XAttribute("name", x.Name ?? "???"),
+                                x.SdrLutPath != null ? new XAttribute("sdr_lut", x.SdrLutPath) : null,
+                                x.HdrLutPath != null ? new XAttribute("hdr_lut", x.HdrLutPath) : null,
+                                x.SdrLuts != null
+                                    ? new XElement("sdr_luts",
+                                        x.SdrLuts.Where(s => !string.IsNullOrEmpty(s))
+                                                 .Select(s => new XElement("sdr_lut", s)))
+                                    : null)));
 
-            xElem.Save(_configPath);
+                xElem.Save(_configPath);
 
-            _lastConfig = xElem;
-            UpdateConfigChanged();
-            UpdateActiveStatus();
+                _lastConfig = xElem;
+                UpdateConfigChanged();
+                UpdateActiveStatus();
+            }
+            catch (Exception)
+            {
+                // Persisting config must never take down the UI. A failed save is non-fatal;
+                // the in-memory selection already applied.
+            }
         }
 
         public string SdrLutPath
@@ -139,6 +161,18 @@ namespace DwmLutGUI
             get => _toggleKey;
         }
 
+        public bool AutostartAsked
+        {
+            set
+            {
+                if (value == _autostartAsked) return;
+                _autostartAsked = value;
+                OnPropertyChanged();
+                SaveConfig();
+            }
+            get => _autostartAsked;
+        }
+
         public bool IsActive
         {
             set
@@ -153,9 +187,21 @@ namespace DwmLutGUI
         public bool CanApply { get; }
 
         private List<MonitorData> _allMonitors { get; }
+        // True only while UpdateMonitors is rebuilding the monitor list. During the rebuild,
+        // MonitorData constructors set SdrLutPath/HdrLutPath through their setters, which raise
+        // StaticPropertyChanged -> SaveConfig; if that ran now it would persist a half-built
+        // _allMonitors and drop whichever monitor has not been added yet. Suppress saves here.
+        private bool _updatingMonitors;
         public ObservableCollection<MonitorData> Monitors { get; }
 
         public void UpdateMonitors()
+        {
+            _updatingMonitors = true;
+            try { UpdateMonitorsCore(); }
+            finally { _updatingMonitors = false; }
+        }
+
+        private void UpdateMonitorsCore()
         {
             var selectedPath = SelectedMonitor?.DevicePath;
             _allMonitors.Clear();
@@ -163,20 +209,28 @@ namespace DwmLutGUI
             List<XElement> config = null;
             if (File.Exists(_configPath))
             {
-                config = XElement.Load(_configPath).Descendants("monitor").ToList();
                 try
                 {
+                    config = XElement.Load(_configPath).Descendants("monitor").ToList();
                     _toggleKey = (Key)Enum.Parse(typeof(Key), (string)XElement.Load(_configPath).Attribute("lut_toggle"));
+                    _autostartAsked = (bool?)XElement.Load(_configPath).Attribute("autostart_asked") ?? false;
                 }
                 catch
                 {
                     _toggleKey = Key.Pause;
+                    _autostartAsked = false;
                 }
             }
             else
             {
                 _toggleKey = Key.Pause;
+                _autostartAsked = false;
             }
+
+            // Globally-unique 1-based ordinal. This is the identity used purely for the '#' column;
+            // it is independent of DisplaySource.SourceId (which is per-adapter and collides on
+            // hybrid multi-GPU laptops, producing "1, 1, 2").
+            var displayIndex = 0;
 
             var paths = WindowsDisplayAPI.DisplayConfig.PathInfo.GetActivePaths();
             foreach (var path in paths)
@@ -185,10 +239,27 @@ namespace DwmLutGUI
                 var targetInfo = path.TargetsInfo[0];
                 var deviceId = targetInfo.DisplayTarget.TargetId;
                 var devicePath = targetInfo.DisplayTarget.DevicePath;
+                if (string.IsNullOrEmpty(devicePath))
+                {
+                    // Some hybrid/virtual adapters expose no device path. Synthesize a stable, unique key
+                    // from position + target id so identity/tracking still works and the config writer
+                    // never sees a null path.
+                    devicePath = "SYNTH\\" + path.Position.X + "_" + path.Position.Y + "_" + deviceId;
+                }
+
                 var name = targetInfo.DisplayTarget.FriendlyName;
                 if (string.IsNullOrEmpty(name))
                 {
-                    name = "???";
+                    // Internal laptop panels frequently ship an EDID with no product-name
+                    // descriptor, so the display API returns an empty FriendlyName. Label such a
+                    // panel by its connection type ("Internal Display") rather than a bare "???".
+                    // (This mirrors what Windows Settings shows when a display has no EDID name;
+                    // eDP laptop panels report as "Internal" or "...Embedded".)
+                    var tech = targetInfo.OutputTechnology.ToString();
+                    name = (tech.IndexOf("Internal", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            tech.IndexOf("Embedded", StringComparison.OrdinalIgnoreCase) >= 0)
+                        ? "Internal Display"
+                        : "???";
                 }
 
                 var connector = targetInfo.OutputTechnology.ToString();
@@ -203,7 +274,8 @@ namespace DwmLutGUI
                 string hdrLutPath = null;
 
                 var settings = config?.FirstOrDefault(x => (uint?)x.Attribute("id") == deviceId) ??
-                               config?.FirstOrDefault(x => (string)x.Attribute("path") == devicePath);
+                               config?.FirstOrDefault(x => (string)x.Attribute("path") == devicePath) ??
+                               config?.FirstOrDefault(x => (string)x.Attribute("name") == name);
 
                 if (settings != null)
                 {
@@ -213,7 +285,10 @@ namespace DwmLutGUI
                 var sdrLutPaths = settings?.Element("sdr_luts")?.Elements("sdr_lut").Select(x => (string)x).ToList();
                 var hdrLutPaths = settings?.Element("hdr_luts")?.Elements("hdr_lut").Select(x => (string)x).ToList();
                 var monitor = new MonitorData(devicePath, path.DisplaySource.SourceId + 1, name, connector, position,
-                    sdrLutPath, hdrLutPath);
+                    sdrLutPath, hdrLutPath)
+                {
+                    DisplayIndex = ++displayIndex
+                };
                 if (sdrLutPaths != null) monitor.SdrLuts = new ObservableCollection<string>(sdrLutPaths);
                 if (hdrLutPaths != null) monitor.HdrLuts = new ObservableCollection<string>(hdrLutPaths);
                 _allMonitors.Add(monitor);
@@ -225,14 +300,14 @@ namespace DwmLutGUI
                 foreach (var monitor in config)
                 {
                     var path = (string)monitor.Attribute("path");
-                    if (path == null || Monitors.Any(x => x.DevicePath == path)) continue;
+                    if (string.IsNullOrEmpty(path) || Monitors.Any(x => x.DevicePath == path)) continue;
 
                     var sdrLutPath = (string)monitor.Attribute("sdr_lut");
                     var hdrLutPath = (string)monitor.Attribute("hdr_lut");
 
                     var sdrLutPaths = monitor.Element("sdr_luts")?.Elements("sdr_lut").Select(x => (string)x).ToList();
                     var hdrLutPaths = monitor.Element("hdr_luts")?.Elements("hdr_lut").Select(x => (string)x).ToList();
-                    var newMonitorData = new MonitorData(path, sdrLutPath, hdrLutPath);
+                    var newMonitorData = new MonitorData(path, sdrLutPath, hdrLutPath) { DisplayIndex = 0 };
                     if (sdrLutPaths != null) newMonitorData.SdrLuts = new ObservableCollection<string>(sdrLutPaths);
                     if (hdrLutPaths != null) newMonitorData.HdrLuts = new ObservableCollection<string>(hdrLutPaths);
                     _allMonitors.Add(newMonitorData);
@@ -293,7 +368,17 @@ namespace DwmLutGUI
 
         public void OnDisplaySettingsChanged(object sender, EventArgs e)
         {
+            var oldState = string.Join(";", Monitors.Select(m => m.Position + "|" + m.SdrLutPath + "|" + m.HdrLutPath));
+
             UpdateMonitors();
+
+            var newState = string.Join(";", Monitors.Select(m => m.Position + "|" + m.SdrLutPath + "|" + m.HdrLutPath));
+
+            if (oldState == newState)
+            {
+                return;
+            }
+
             if (!_configChanged)
             {
                 ReInject();

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -53,15 +53,22 @@ namespace DwmLutGUI
             bool? result = false;
             foreach (var dwm in dwmInstances)
             {
-                var modules = dwm.Modules;
-                foreach (ProcessModule module in modules)
+                try
                 {
-                    if (module.ModuleName == DllName)
+                    var modules = dwm.Modules;
+                    foreach (ProcessModule module in modules)
                     {
-                        result = true;
-                    }
+                        if (module.ModuleName == DllName)
+                        {
+                            result = true;
+                        }
 
-                    module.Dispose();
+                        module.Dispose();
+                    }
+                }
+                catch
+                {
+                    result = null;
                 }
 
                 dwm.Dispose();
@@ -131,27 +138,40 @@ namespace DwmLutGUI
                 throw new Exception("Failed to impersonate logged on user");
             }
 
-            // Get username of the current process
-            StringBuilder userName = new StringBuilder(1024);
-            uint userNameSize = (uint)userName.Capacity;
-            var userNameResult = GetUserName(userName, ref userNameSize);
-            if (!userNameResult)
+            using (var identity = System.Security.Principal.WindowsIdentity.GetCurrent())
             {
-                throw new Exception("Failed to get username");
-            }
-
-            // Check if the username is SYSTEM
-            if (userName.ToString() != "SYSTEM")
-            {
-                throw new Exception("Not running as SYSTEM");
+                if (!identity.IsSystem)
+                {
+                    throw new Exception("Not running as SYSTEM");
+                }
             }
         }
 
         public static void Inject(IEnumerable<MonitorData> monitors)
         {
             ElevatePrivilege();
-            
-            File.Copy(AppDomain.CurrentDomain.BaseDirectory + DllName, DllPath, true);
+
+            bool copied = false;
+            for (int attempt = 0; attempt < 20; attempt++)
+            {
+                try
+                {
+                    File.Copy(AppDomain.CurrentDomain.BaseDirectory + DllName, DllPath, true);
+                    copied = true;
+                    break;
+                }
+                catch (IOException)
+                {
+                    System.Threading.Thread.Sleep(50);
+                }
+            }
+
+            if (!copied)
+            {
+                // Fallback to try copying one last time, let it throw the real error if it fails
+                File.Copy(AppDomain.CurrentDomain.BaseDirectory + DllName, DllPath, true);
+            }
+
             ClearPermissions(DllPath);
 
             if (Directory.Exists(LutsPath))
@@ -219,27 +239,66 @@ namespace DwmLutGUI
 
         public static void Uninject()
         {
+            bool elevated = false;
+            try
+            {
+                ElevatePrivilege();
+                elevated = true;
+            }
+            catch { }
+
             var dwmInstances = Process.GetProcessesByName("dwm");
             foreach (var dwm in dwmInstances)
             {
-                var modules = dwm.Modules;
-                foreach (ProcessModule module in modules)
+                System.Diagnostics.ProcessModuleCollection modules = null;
+                for (int attempt = 0; attempt < 10; attempt++)
                 {
-                    if (module.ModuleName == DllName)
+                    try
                     {
-                        var thread = CreateRemoteThread(dwm.Handle, IntPtr.Zero, 0, FreeLibrary, module.BaseAddress,
-                            0, out _);
-                        WaitForSingleObject(thread, uint.MaxValue);
-                        CloseHandle(thread);
+                        modules = dwm.Modules;
+                        break;
                     }
+                    catch
+                    {
+                        System.Threading.Thread.Sleep(100);
+                    }
+                }
 
-                    module.Dispose();
+                if (modules != null)
+                {
+                    foreach (ProcessModule module in modules)
+                    {
+                        try
+                        {
+                            if (module.ModuleName == DllName)
+                            {
+                                var thread = CreateRemoteThread(dwm.Handle, IntPtr.Zero, 0, FreeLibrary, module.BaseAddress,
+                                    0, out _);
+                                WaitForSingleObject(thread, uint.MaxValue);
+                                CloseHandle(thread);
+                            }
+                        }
+                        catch { }
+                        finally
+                        {
+                            module.Dispose();
+                        }
+                    }
                 }
 
                 dwm.Dispose();
             }
 
-            File.Delete(DllPath);
+            if (elevated)
+            {
+                RevertToSelf();
+            }
+
+            try
+            {
+                File.Delete(DllPath);
+            }
+            catch { }
         }
 
         private static void ClearPermissions(string path)

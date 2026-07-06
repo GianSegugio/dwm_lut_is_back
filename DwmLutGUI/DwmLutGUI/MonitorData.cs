@@ -20,23 +20,33 @@ namespace DwmLutGUI
         {
             SdrLuts = new ObservableCollection<string>();
             HdrLuts = new ObservableCollection<string>();
-            DevicePath = devicePath;
+            // Never store null identity fields: they later feed XAttribute(name,value) in SaveConfig,
+            // which throws ArgumentNullException("value") on null. Coalesce at the source.
+            DevicePath = devicePath ?? "";
             SourceId = sourceId;
-            Name = name;
-            Connector = connector;
-            Position = position;
+            Name = string.IsNullOrEmpty(name) ? "???" : name;
+            Connector = connector ?? "";
+            Position = position ?? "";
             SdrLutPath = sdrLutPath;
             HdrLutPath = hdrLutPath;
         }
 
+        // Config-only monitors (present in config.xml but not currently connected).
         public MonitorData(string devicePath, string sdrLutPath, string hdrLutPath)
         {
             SdrLuts = new ObservableCollection<string>();
             HdrLuts = new ObservableCollection<string>();
-            DevicePath = devicePath;
+            DevicePath = devicePath ?? "";
+            Name = "???";        // was previously left null -> ArgumentNullException on next SaveConfig
+            Connector = "";
+            Position = "";
             SdrLutPath = sdrLutPath;
             HdrLutPath = hdrLutPath;
         }
+
+        // 1-based, globally-unique ordinal for the '#' column. Assigned during enumeration.
+        // Fixes the "1, 1, 2" overlap: DisplaySource.SourceId is per-ADAPTER and collides across GPUs.
+        public int DisplayIndex { get; set; }
 
         public string DevicePath { get; }
         public uint SourceId { get; }
@@ -46,7 +56,6 @@ namespace DwmLutGUI
 
         public ObservableCollection<string> SdrLuts { get; set; }
         public ObservableCollection<string> HdrLuts { get; set; }
-
 
         public string SdrLutPath
         {
@@ -68,10 +77,9 @@ namespace DwmLutGUI
             set
             {
                 if (value == _hdrLutPath) return;
+                if (value == null) return;                       // was missing -> could Add(null) to HdrLuts
                 if (value != "None" && !HdrLuts.Contains(value))
-                {
                     HdrLuts.Add(value);
-                }
                 _hdrLutPath = value != "None" ? value : null;
                 PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HdrLutFilename)));
                 StaticPropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HdrLutFilename)));
@@ -79,8 +87,10 @@ namespace DwmLutGUI
             get => _hdrLutPath;
         }
 
-        public string SdrLutFilename => Path.GetFileName(SdrLutPath) ?? "None";
+        public string SdrLutFilename =>
+            string.IsNullOrEmpty(SdrLutPath) ? "None" : (Path.GetFileName(SdrLutPath) ?? "None");
 
-        public string HdrLutFilename => Path.GetFileName(HdrLutPath) ?? "None";
+        public string HdrLutFilename =>
+            string.IsNullOrEmpty(HdrLutPath) ? "None" : (Path.GetFileName(HdrLutPath) ?? "None");
     }
 }
