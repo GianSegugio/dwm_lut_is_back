@@ -233,6 +233,7 @@ namespace DwmLutGUI
             var displayIndex = 0;
 
             var paths = WindowsDisplayAPI.DisplayConfig.PathInfo.GetActivePaths();
+            var hdrStates = HdrInfo.GetHdrStates();   // device path -> currently in HDR mode
             foreach (var path in paths)
             {
                 if (path.IsCloneMember) continue;
@@ -291,6 +292,8 @@ namespace DwmLutGUI
                 };
                 if (sdrLutPaths != null) monitor.SdrLuts = new ObservableCollection<string>(sdrLutPaths);
                 if (hdrLutPaths != null) monitor.HdrLuts = new ObservableCollection<string>(hdrLutPaths);
+                bool isHdr;
+                monitor.IsHdr = !string.IsNullOrEmpty(devicePath) && hdrStates.TryGetValue(devicePath, out isHdr) && isHdr;
                 _allMonitors.Add(monitor);
                 Monitors.Add(monitor);
             }

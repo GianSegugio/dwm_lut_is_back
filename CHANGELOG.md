@@ -7,6 +7,37 @@ This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246** and **10.0
 
 ---
 ---
+
+## v1.0.1
+
+### C# UI — `DwmLutGUI`
+
+#### `MonitorData.cs`
+- **HDR awareness.** Added `IsHdr` and a derived `HdrStatus` ("HDR"/"SDR").
+
+#### `MainViewModel.cs`
+- **HDR awareness.** Each enumeration queries HDR states once and tags every monitor (matched by device path); refreshes on display-settings changes (e.g. toggling HDR in Windows).
+
+#### `HdrInfo.cs`
+- **HDR awareness.** Queries `QueryDisplayConfig` + `DisplayConfigGetDeviceInfo` (`GET_ADVANCED_COLOR_INFO`, `advancedColorEnabled` bit) and returns a device-path -> HDR-enabled map. Fully exception-guarded; any failure reports nothing (treated as SDR).
+
+#### `MainWindow.xaml`
+- **HDR awareness.** New **"Mode"** column in the monitor list showing HDR / SDR.
+
+#### `MainWindow.xaml.cs`
+- **HDR awareness.** Assigning a LUT that can't apply in the display's current mode now shows a warning (an SDR LUT on an HDR display, or an HDR LUT on an SDR display).
+
+---
+
+### C++ injector — `lutdwm/dllmain.cpp`
+
+#### HDR / SDR LUT selection
+- **Was:** for the primary HDR context, if no LUT of the matching type existed, the code fell back to a LUT of the *opposite* type (SDR<->HDR pairing). Since the shader's HDR math follows the backbuffer format, not the LUT, a mismatched LUT ran through the wrong pipeline (e.g. an SDR-calibrated LUT fed PQ/BT.2100 input) and produced wrong colors.
+- **Is:** `GetLUTDataFromCOverlayContext` is **exact-match only** — an HDR context takes an HDR LUT, an SDR context takes an SDR LUT, and if the only LUT assigned is the wrong type for the display's current mode, **no LUT is applied** (correct-or-nothing) instead of a mis-calibrated one. The bidirectional pairing fallback and the now-dead `g_primaryHdrContext` global were removed.
+
+---
+---
+
 ## v1.0.0
 
 ### C# UI — `DwmLutGUI`
@@ -104,7 +135,8 @@ This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246** and **10.0
 | Per-monitor native resolution | `self + 0x4A24` (`0,0,W,H`) — alternate identifier |
 | `CDeviceManager::ProcessDeviceLost` | RVA `0x0EF370` (unique 33-byte prologue; hooked for the device-lost fix) |
 | DWM device vector (`CDeviceManager`) | `.data` `_Myfirst`/`_Mylast` RVA `0x3FDA88`/`0x3FDA90`; `DeviceInfo` stride `0x10`; lost-flag `device+0x458` |
-**26100.8655 delta:** same structure, shifted RVAs — `Present` `0x231800`, `OverlaysEnabled` `0x1A2BE8`, `IsCandidateDirectFlipCompatible` `0xB1414` (member `0x4BF8`), `ProcessDeviceLost` `0xDCF80`, and device vector `_Myfirst`/`_Mylast` `0x3FAB78`/`0x3FAB80`. Signature bytes, clip-box `0x7658`, stride `0x10`, and lost-flag `0x458` are unchanged.
+
+***26100.8655 delta:** same structure, shifted RVAs — `Present` `0x231800`, `OverlaysEnabled` `0x1A2BE8`, `IsCandidateDirectFlipCompatible` `0xB1414` (member `0x4BF8`), `ProcessDeviceLost` `0xDCF80`, and device vector `_Myfirst`/`_Mylast` `0x3FAB78`/`0x3FAB80`. Signature bytes, clip-box `0x7658`, stride `0x10`, and lost-flag `0x458` are unchanged.*
 
 ---
 

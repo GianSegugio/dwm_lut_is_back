@@ -32,12 +32,14 @@ A WPF application used to configure and monitor the LUT application status.
 - **UAC Bypass Autostart**: Uses Windows Task Scheduler to launch with highest privileges on system logon.
 - **DLL Injection**: Automates the `CreateRemoteThread` injection process into `dwm.exe`.
 - **Minimized Operation**: Runs in the system tray to keep LUTs active without cluttering the taskbar.
+- **HDR awareness**: Detects each display's current HDR (advanced-color) state, shows it in the monitor list's **Mode** column, and warns if you assign a LUT that can't apply in that mode (e.g. an SDR LUT to an HDR display). A LUT is applied only when its type matches the display's mode (see *HDR / SDR LUT selection*).
 
 #### Project Layout:
 - `DwmLutGUI/MainWindow.xaml`: Main user interface.
 - `DwmLutGUI/MonitorData.cs`: Per-monitor model (identity, LUT paths, display index).
 - `DwmLutGUI/Injector.cs`: Handles process discovery and DLL injection.
 - `DwmLutGUI/MainViewModel.cs`: Core application logic, monitor enumeration, and config persistence.
+- `DwmLutGUI/HdrInfo.cs`: Queries Windows for each display's HDR (advanced-color) state.
 
 ---
 
@@ -69,6 +71,9 @@ Multiple adapter devices are held **simultaneously** — a hybrid laptop composi
 ### Version Profiles
 Each supported `dwmcore.dll` build is one **`DwmProfile`** row in `g_dwmProfiles[]`, and every row is self-contained: the dwmcore version, the four AOB signatures (embedded inline as fixed-size byte arrays, `'?'` = wildcard), and the build-specific offsets (clip-box + device-vector). At load, the engine reads the running `dwmcore.dll`'s file version and selects the newest row whose minimum version it satisfies (newest-first; a version-read failure falls back to the newest row; an unmatched build is skipped). Two builds are currently profiled — **26100.8246** and **26100.8655** — which share identical signatures but differ in their device-vector addresses. Supporting a future build is a single new row. (The 24H2 / 23H2 / legacy paths are not part of this table and are unchanged.)
 
+### HDR / SDR LUT selection
+DWM composites an HDR display into an FP16 (scRGB) backbuffer and an SDR display into an 8/10-bit backbuffer, and the shader applies the LUT through an HDR (PQ/BT.2100) or SDR path accordingly — so a LUT is only valid for the mode it was calibrated in. The engine matches **exactly**: an HDR context takes the HDR LUT, an SDR context takes the SDR LUT. If the only LUT assigned to a display is the wrong type for its current mode, **no LUT is applied** rather than a mismatched one (which, run through the other path, would produce wrong colors). Use an HDR LUT (a `.cube` with `hdr` in the filename, calibrated in HDR) for a display in HDR mode, and an SDR LUT for SDR mode.
+
 ### Fullscreen Device-Lost Handling
 Recent DWM builds run a **resource-leak checker** that deliberately breaks (`int 3`, crashing DWM) if it destroys one of its internal D3D devices while resources are still alive on it. 
 Because the engine's LUT resources live on DWM's device, a real display-mode change (for example an old DirectDraw game entering a native-resolution fullscreen) would tear down a device that still held them and crash DWM. 
@@ -95,7 +100,8 @@ The handler runs every frame, so this release is gated rather than unconditional
 | Per-monitor native resolution | `self + 0x4A24` (`0,0,W,H`) — alternate identifier |
 | `CDeviceManager::ProcessDeviceLost` | RVA `0x0EF370` (unique 33-byte prologue; hooked for the device-lost fix) |
 | DWM device vector (`CDeviceManager`) | `.data` `_Myfirst`/`_Mylast` RVA `0x3FDA88`/`0x3FDA90`; `DeviceInfo` stride `0x10`; lost-flag `device+0x458` |
-**26100.8655 delta:** same structure, shifted RVAs — `Present` `0x231800`, `OverlaysEnabled` `0x1A2BE8`, `IsCandidateDirectFlipCompatible` `0xB1414` (member `0x4BF8`), `ProcessDeviceLost` `0xDCF80`, and device vector `_Myfirst`/`_Mylast` `0x3FAB78`/`0x3FAB80`. Signature bytes, clip-box `0x7658`, stride `0x10`, and lost-flag `0x458` are unchanged.
+
+***26100.8655 delta:** same structure, shifted RVAs — `Present` `0x231800`, `OverlaysEnabled` `0x1A2BE8`, `IsCandidateDirectFlipCompatible` `0xB1414` (member `0x4BF8`), `ProcessDeviceLost` `0xDCF80`, and device vector `_Myfirst`/`_Mylast` `0x3FAB78`/`0x3FAB80`. Signature bytes, clip-box `0x7658`, stride `0x10`, and lost-flag `0x458` are unchanged.*
 
 ## Verified dwmcore values
 

@@ -670,8 +670,6 @@ bool AddLUTs(char* folder)
 int numLutTargets;
 void** lutTargets;
 
-static void* g_primaryHdrContext = NULL;
-
 bool IsLUTActive(void* target)
 {
 	for (int i = 0; i < numLutTargets; i++)
@@ -831,21 +829,15 @@ lutData* GetLUTDataFromCOverlayContext(void* context, bool hdr, int* out_index)
 	if (!ClaimPosition(left, top, context))
 		return NULL;
 
+	// Exact match only: an HDR context takes an HDR LUT, an SDR context takes an SDR LUT. If the only LUT
+	// for this monitor is the wrong type for its current mode, apply nothing (correct-or-nothing) rather
+	// than run a LUT through the mismatched shader path, which produces wrong colors in either direction.
 	for (int i = 0; i < numLuts; i++)
 		if (luts[i].left == left && luts[i].top == top && luts[i].isHdr == hdr)
 		{
 			if (out_index) *out_index = i;
 			return &luts[i];
 		}
-
-	// Primary HDR context: allow SDR<->HDR pairing for the same resolved origin.
-	if ((isWindows11_25h2 || isWindows11_24h2 || isWindows11) && g_primaryHdrContext == context)
-		for (int i = 0; i < numLuts; i++)
-			if (luts[i].left == left && luts[i].top == top && luts[i].isHdr != hdr)
-			{
-				if (out_index) *out_index = i;
-				return &luts[i];
-			}
 
 	return NULL;
 }
@@ -1065,7 +1057,6 @@ bool RenderLUT(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, i
 	else if (bbDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
 	{
 		index = 1;
-		if (isWindows11_25h2 && g_primaryHdrContext == NULL) g_primaryHdrContext = self;
 	}
 	if (index == -1) return false;
 

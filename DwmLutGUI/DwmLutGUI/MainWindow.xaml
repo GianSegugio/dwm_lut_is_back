@@ -67,6 +67,7 @@
                     <DataGridTextColumn Header="Name" Binding="{Binding Name}" IsReadOnly="True" />
                     <DataGridTextColumn Header="Connector" Binding="{Binding Connector}" IsReadOnly="True" />
                     <DataGridTextColumn Header="Position" Binding="{Binding Position}" IsReadOnly="True" />
+                    <DataGridTextColumn Header="Mode" Binding="{Binding HdrStatus}" IsReadOnly="True" />
                     <DataGridTemplateColumn Header="SDR LUT" Width="*" IsReadOnly="False">
                         <DataGridTemplateColumn.CellTemplate>
                             <DataTemplate>

@@ -324,6 +324,7 @@ namespace DwmLutGUI
             if (!string.IsNullOrEmpty(lutPath))
             {
                 _viewModel.SdrLutPath = lutPath;
+                WarnIfLutModeMismatch(false);
             }
         }
 
@@ -339,7 +340,25 @@ namespace DwmLutGUI
             if (!string.IsNullOrEmpty(lutPath))
             {
                 _viewModel.HdrLutPath = lutPath;
+                WarnIfLutModeMismatch(true);
             }
+        }
+
+        // Warn if the just-assigned LUT can't apply in the display's current mode. The DLL only applies a
+        // LUT whose type matches the composition (HDR LUT for an HDR display, SDR LUT for an SDR display);
+        // a mismatched LUT is silently ignored, so surface that here instead of leaving the user puzzled.
+        private void WarnIfLutModeMismatch(bool isHdrLut)
+        {
+            var m = _viewModel.SelectedMonitor;
+            if (m == null) return;
+            if (isHdrLut && !m.IsHdr)
+                MessageBox.Show(
+                    "This display is currently in SDR mode.\n\nAn HDR LUT is only applied while the display is in HDR mode, so it will have no effect right now. Assign an SDR LUT for SDR mode, or enable HDR for this display in Windows display settings.",
+                    "LUT / display-mode mismatch", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            else if (!isHdrLut && m.IsHdr)
+                MessageBox.Show(
+                    "This display is currently in HDR mode.\n\nAn SDR LUT is only applied while the display is in SDR mode, so it will have no effect right now. Assign an HDR LUT for HDR mode, or disable HDR for this display in Windows display settings.",
+                    "LUT / display-mode mismatch", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         private void HdrLutClear_Click(object sender, RoutedEventArgs e)

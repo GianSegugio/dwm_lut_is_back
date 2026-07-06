@@ -53,6 +53,8 @@ namespace DwmLutGUI
         public string Name { get; }
         public string Connector { get; }
         public string Position { get; }
+        public bool IsHdr { get; set; }                    // display currently in HDR (advanced color) mode
+        public string HdrStatus => IsHdr ? "HDR" : "SDR";  // shown in the monitor list "Mode" column
 
         public ObservableCollection<string> SdrLuts { get; set; }
         public ObservableCollection<string> HdrLuts { get; set; }
