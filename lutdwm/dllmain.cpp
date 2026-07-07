@@ -325,6 +325,13 @@ struct DwmProfile
 	unsigned int deviceVecLastRva;    // .data addr of the device vector's _Mylast (end) pointer
 	int deviceInfoStride;             // bytes per DeviceInfo element in that vector
 	int deviceLostFlagOffset;         // offset in the device object; nonzero => flagged lost/about-to-erase
+	// Fullscreen-overlay suppression: on this build, hook COverlayContext::OverlaysEnabled (forcing it
+	// false for LUT contexts) to keep the LUT applied over fullscreen apps. It is installed via the
+	// register-preserving asm thunk (OverlaysEnabled_thunk), because DWM's IsDFlipOnMPO relies on r8
+	// surviving the call and a plain detour crashes it. Verified on 26100.8246 / 8655. A future build
+	// that needs a different mechanism can set this false. (Not RE-derived data -- the thunk itself is
+	// build-independent -- but a per-build switch so the decision lives with the rest of the profile.)
+	bool overlaysEnabledThunk;
 };
 
 // Newest-first: SelectDwmProfile() returns the first row whose minVersion <= the running dwmcore.
@@ -351,7 +358,8 @@ static const DwmProfile g_dwmProfiles[] = {
 			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x48, 0x08, 0x56,
 			  0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x40, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0x0D, '?', '?', '?', '?' }, 33,
 		},
-		0x7658, 0x3FAB78, 0x3FAB80, 0x10, 0x458   // clipBox, vecFirst, vecLast, stride, flag
+		0x7658, 0x3FAB78, 0x3FAB80, 0x10, 0x458,  // clipBox, vecFirst, vecLast, stride, flag
+		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
 	},
 
 	// Windows 11 25H2 - dwmcore 10.0.26100.8246
@@ -371,7 +379,8 @@ static const DwmProfile g_dwmProfiles[] = {
 			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x48, 0x08, 0x56,
 			  0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x40, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0x0D, '?', '?', '?', '?' }, 33,
 		},
-		0x7658, 0x3FDA88, 0x3FDA90, 0x10, 0x458   // clipBox, vecFirst, vecLast, stride, flag
+		0x7658, 0x3FDA88, 0x3FDA90, 0x10, 0x458,  // clipBox, vecFirst, vecLast, stride, flag
+		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
 	},
 };
 
@@ -1514,20 +1523,28 @@ bool COverlayContext_IsCandidateDirectFlipCompatible_hook(void* self, void* a2, 
 	return COverlayContext_IsCandidateDirectFlipCompatible_orig(self, a2, a3, a4, a5, a6, a7, a8);
 }
 
-// COverlayContext::OverlaysEnabled hook. IMPORTANT: on 25H2 (>= 26200.8246) this is NOT installed (see
-// the version-gated MH_CreateHook further down). There it is both redundant -- with OverlayTestMode
-// forced to 5 the real OverlaysEnabled already returns false for every context (it takes the `je`
-// early-out to `xor al,al; ret`) -- AND unsafe: DWM's COverlayContext::OverlayPlaneInfo::IsDFlipOnMPO
-// calls OverlaysEnabled and then relies on r8 surviving the call (the compiler did interprocedural
-// register allocation, knowing the real callee only touches rcx/al). A C++ detour clobbers r8, which
-// crashed DWM (INVALID_POINTER_READ in IsDFlipOnMPO) during fullscreen-overlay evaluation. The hook is
-// still installed on older builds (24H2 / 23H2 / Win10), which we have not verified, so as not to
-// change their behavior.
+// COverlayContext::OverlaysEnabled. Forcing this to return false for LUT-active contexts keeps the LUT
+// applied over composited fullscreen surfaces (OverlayTestMode=5 alone does NOT hold on the fullscreen
+// overlay-config path). On 25H2 the detour is a register-preserving assembly thunk (OverlaysEnabled_thunk,
+// in OverlaysEnabledThunk.asm), because DWM's IsDFlipOnMPO dereferences r8 after the call and a plain C++
+// detour clobbers it (INVALID_POINTER_READ crash); the thunk saves/restores rcx/rdx/r8-r11 around this
+// hook. NOTE: this does NOT make IndependentFlip'd fullscreen games take the LUT -- that is a DWM
+// composite-vs-flip decision outside this hook's reach. Older
+// builds (24H2 / 23H2, unverified) call this C++ hook directly, unchanged.
 typedef bool (COverlayContext_OverlaysEnabled_t)(void*);
 
 COverlayContext_OverlaysEnabled_t* COverlayContext_OverlaysEnabled_orig  = NULL;
 
-bool COverlayContext_OverlaysEnabled_hook(void* self)
+// Defined in OverlaysEnabledThunk.asm. IntelliSense does not parse .asm, so it reports "definition not
+// found"; give it a stub under __INTELLISENSE__ (which the real compiler never sees -- it links the asm).
+#ifdef __INTELLISENSE__
+extern "C" bool OverlaysEnabled_thunk(void* self) { return false; }
+#else
+extern "C" bool OverlaysEnabled_thunk(void* self);  // register-preserving detour, OverlaysEnabledThunk.asm
+#endif
+
+// extern "C" so the asm thunk can call it by an unmangled name.
+extern "C" bool COverlayContext_OverlaysEnabled_hook(void* self)
 {
 	if (IsLUTActive(self))
 	{
@@ -1972,12 +1989,20 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 					LOG_ONLY_ONCE("FAILED to find g_pOverlayTestMode")
 				}
 
-				// OverlaysEnabled: install the hook ONLY on older builds. On 25H2 (>= 26200.8246) it is
-				// redundant (OverlayTestMode=5 already forces a false return) and it crashed DWM by
-				// clobbering r8 that IsDFlipOnMPO relies on across the call, so it is skipped there.
-				if (!isWindows11_25h2)
-					MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)COverlayContext_OverlaysEnabled_hook,
-					              (PVOID*)&COverlayContext_OverlaysEnabled_orig);
+				// OverlaysEnabled suppression (forces false for LUT contexts -> keeps the LUT over
+				// fullscreen apps). The active profile decides whether to use the register-preserving asm
+				// thunk (needed on 25H2, where a plain C++ detour clobbers r8 and crashes DWM's
+				// IsDFlipOnMPO -- see the note by the typedef). Builds with no profile / the flag unset
+				// (24H2 / 23H2, unverified) use the plain C++ hook, unchanged.
+				if (COverlayContext_OverlaysEnabled_orig)
+				{
+					if (g_activeDwmProfile != NULL && g_activeDwmProfile->overlaysEnabledThunk)
+						MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)OverlaysEnabled_thunk,
+						              (PVOID*)&COverlayContext_OverlaysEnabled_orig);
+					else
+						MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)COverlayContext_OverlaysEnabled_hook,
+						              (PVOID*)&COverlayContext_OverlaysEnabled_orig);
+				}
 				if (CDeviceManager_ProcessDeviceLost_orig)
 					MH_CreateHook((PVOID)CDeviceManager_ProcessDeviceLost_orig, (PVOID)CDeviceManager_ProcessDeviceLost_hook,
 					              (PVOID*)&CDeviceManager_ProcessDeviceLost_orig);

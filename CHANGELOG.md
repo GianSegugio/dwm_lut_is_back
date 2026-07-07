@@ -8,13 +8,26 @@ This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246** and **10.0
 ---
 ---
 
+## v1.0.3
+
+### C++ injector — `lutdwm/dllmain.cpp`
+
+#### Fullscreen `OverlaysEnabled` hook restored via a register-preserving thunk (25H2)
+- **Was (v1.0.2):** the `COverlayContext::OverlaysEnabled` hook is removed on 25H2 as a first mitigation for the `IsDFlipOnMPO` crash. But that hook — forcing `OverlaysEnabled` to return `false` for LUT-active contexts — is what keeps DWM **compositing** (rather than direct-flipping) those surfaces, so removing it also stopped the LUT from applying over composited fullscreen surfaces (e.g. fullscreen browser video).
+- **Is (v1.0.3):** the hook is installed again on 25H2, but through a **register-preserving assembly thunk** (`OverlaysEnabled_thunk`, in the new `OverlaysEnabledThunk.asm`). DWM's `IsDFlipOnMPO` dereferences `r8` after calling `OverlaysEnabled` and relies on it surviving the call (interprocedural register allocation, since the real, tiny callee only touches `rcx`/`al`); a plain C++ detour clobbers `r8` and faults. The thunk saves/restores `rcx`/`rdx`/`r8`–`r11` around the hook, so the crash stays fixed **and** the LUT applies again over composited fullscreen surfaces. Whether to use the thunk is a per-build flag `overlaysEnabledThunk` in `DwmProfile` (set on 26100.8246 / 8655); older builds (24H2 / 23H2) keep the plain C++ hook, unchanged.
+- **Build:** `lutdwm.vcxproj` gains the MASM build customization (`masm.props` / `masm.targets`) and the `.asm` as a `<MASM>` item, so it assembles with no manual Visual Studio setup (x64 only).
+- **Documented limitation:** this does **not** make all IndependentFlip'd fullscreen/borderless games take the LUT. A LUT only applies while DWM composites a surface; a flip-model game swapchain promoted to IndependentFlip (direct scanout) bypasses composition, and the decision has no hookable entry point on 25H2. See **Known Limitations** in DOCUMENTATION.md.
+
+---
+---
+
 ## v1.0.2
 
 ### C++ injector — `lutdwm/dllmain.cpp`
 
 #### Fullscreen-overlay DWM crash (25H2)
 - **Was:** on 25H2, taking a video fullscreen (e.g. a windowed browser video on an external display in a multi-GPU setup) could crash DWM a couple seconds later — `INVALID_POINTER_READ` in `COverlayContext::OverlayPlaneInfo::IsDFlipOnMPO`, reached from `InitCheckCandidatesList` / `ComputeOverlayConfiguration` on the composition thread. Root cause: we hooked `COverlayContext::OverlaysEnabled`, but `IsDFlipOnMPO` calls it and then relies on `r8` surviving the call (the compiler did interprocedural register allocation, since the real, tiny `OverlaysEnabled` only touches `rcx`/`al`). A C++ detour clobbers `r8`, so the following `cmp [r8+0x168]` read a bad address.
-- **Is:** on 25H2 (`>= 26200.8246`) the `OverlaysEnabled` hook is **no longer installed**. It was redundant there anyway — with `OverlayTestMode` forced to `5`, the real `OverlaysEnabled` already returns `false` for every context — so MPO/DirectFlip suppression is unchanged; only the crash-causing detour is gone. The function's address is still resolved (to locate the `OverlayTestMode` global) and `OverlayTestMode = 5` is still forced. The hook is **kept on older builds** (24H2 / 23H2), which are unverified, so their behavior is untouched.
+- **Is:** on 25H2 (`>= 26200.8246`) the `OverlaysEnabled` hook is **removed** as a first, minimal mitigation for the crash. Its address is still resolved (to locate the `OverlayTestMode` global) and `OverlayTestMode = 5` is still forced. The hook is **kept on older builds** (24H2 / 23H2), which are unverified, so their behavior is untouched.
 
 ---
 ---
