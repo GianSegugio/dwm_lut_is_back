@@ -59,6 +59,8 @@ DWM no longer exposes an `IDXGISwapChain` through standard patterns. The engine 
 ### MPO / DirectFlip Suppression
 To ensure the LUT is applied even during DirectFlip or MPO (Multi-Plane Overlays), the engine forces the `OverlayTestMode` global to `5`. The global is resolved via the `COverlayContext::OverlaysEnabled` signature. `COverlayContext::IsCandidateDirectFlipCompatible` is also hooked; note its function prologue is ambiguous on this build (two matches), so the correct instance is disambiguated by its member offset.
 Several finer-grained suppression functions (`CWindowContext`/`CCompSwapChain`/`CCompVisual` candidates) are **inlined** on this build and therefore not hookable as standalone functions; forcing `OverlayTestMode = 5` covers MPO suppression globally in their place.
+On 25H2 the engine resolves `COverlayContext::OverlaysEnabled` (to locate the `OverlayTestMode` global) but does **not** hook it: with `OverlayTestMode = 5` the real function already returns `false` for every context, so a hook is redundant. It also proved unsafe there — `COverlayContext::OverlayPlaneInfo::IsDFlipOnMPO` calls `OverlaysEnabled` and relies (via the compiler's interprocedural register allocation) on `r8`
+surviving the call, which a C++ detour does not, crashing DWM during fullscreen-overlay evaluation. On older builds (24H2 / 23H2) the hook is still installed, as they are unverified.
 
 ### Multi-GPU Resource Model
 Rendering resources are split into two levels:
@@ -129,9 +131,10 @@ The handler runs every frame, so this release is gated rather than unconditional
   - *Wrong monitor / wrong colors* → the clip-box **offset** (`0x7658`) or `GetBackBuffer_25H2`'s `vt[24]`/`vt2[19]` indices moved.
   - *Flicker / LUT dropping out on a surface* → `OverlayTestMode` / the overlay hooks moved.
   - *DWM crashes again on a fullscreen mode change* → the `ProcessDeviceLost` signature or a device-vector offset moved (per build; `0x3FDA88`/`0x3FDA90` on 8246, `0x3FAB78`/`0x3FAB80` on 8655; stride `0x10`, flag `0x458`).
+  - *DWM crashes when a video/app goes fullscreen (overlay path)* → a hooked overlay function is being relied upon by DWM to preserve a volatile register across the call. On 25H2 `OverlaysEnabled` is left unhooked for this reason; if a similar crash appears with another overlay hook (`IsCandidateDirectFlipCompatible` family) in the stack, it needs the same treatment.
   Adding support for a new build is a **single prepended `g_dwmProfiles[]` entry**, but obtaining the values is a reverse-engineering pass (disassembly + live capture).
 - **Exclusive / mode-changed fullscreen is not *guaranteed* to be color-managed:** (e.g. old DirectDraw games switching to a native-resolution fullscreen): such surfaces bypass DWM composition, so the LUT is not reliably reachable (matches ledoge's original limitation). This **no longer crashes DWM** and **recovers its LUTs cleanly on exit**, even on a multi-GPU / multi-monitor setup. The LUT may remain applied through such a fullscreen DWM bypass, now that resources stay stable across the transition, but that is not guaranteed.
 
 ---
 
-*Last Updated: 06 July 2026*
+*Last Updated: 07 July 2026*

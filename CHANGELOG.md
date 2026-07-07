@@ -8,6 +8,17 @@ This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246** and **10.0
 ---
 ---
 
+## v1.0.2
+
+### C++ injector — `lutdwm/dllmain.cpp`
+
+#### Fullscreen-overlay DWM crash (25H2)
+- **Was:** on 25H2, taking a video fullscreen (e.g. a windowed browser video on an external display in a multi-GPU setup) could crash DWM a couple seconds later — `INVALID_POINTER_READ` in `COverlayContext::OverlayPlaneInfo::IsDFlipOnMPO`, reached from `InitCheckCandidatesList` / `ComputeOverlayConfiguration` on the composition thread. Root cause: we hooked `COverlayContext::OverlaysEnabled`, but `IsDFlipOnMPO` calls it and then relies on `r8` surviving the call (the compiler did interprocedural register allocation, since the real, tiny `OverlaysEnabled` only touches `rcx`/`al`). A C++ detour clobbers `r8`, so the following `cmp [r8+0x168]` read a bad address.
+- **Is:** on 25H2 (`>= 26200.8246`) the `OverlaysEnabled` hook is **no longer installed**. It was redundant there anyway — with `OverlayTestMode` forced to `5`, the real `OverlaysEnabled` already returns `false` for every context — so MPO/DirectFlip suppression is unchanged; only the crash-causing detour is gone. The function's address is still resolved (to locate the `OverlayTestMode` global) and `OverlayTestMode = 5` is still forced. The hook is **kept on older builds** (24H2 / 23H2), which are unverified, so their behavior is untouched.
+
+---
+---
+
 ## v1.0.1
 
 ### C# UI — `DwmLutGUI`
@@ -140,4 +151,4 @@ This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246** and **10.0
 
 ---
 
-*Last Updated: 06 July 2026*
+*Last Updated: 07 July 2026*

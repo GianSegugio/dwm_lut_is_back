@@ -1514,6 +1514,15 @@ bool COverlayContext_IsCandidateDirectFlipCompatible_hook(void* self, void* a2, 
 	return COverlayContext_IsCandidateDirectFlipCompatible_orig(self, a2, a3, a4, a5, a6, a7, a8);
 }
 
+// COverlayContext::OverlaysEnabled hook. IMPORTANT: on 25H2 (>= 26200.8246) this is NOT installed (see
+// the version-gated MH_CreateHook further down). There it is both redundant -- with OverlayTestMode
+// forced to 5 the real OverlaysEnabled already returns false for every context (it takes the `je`
+// early-out to `xor al,al; ret`) -- AND unsafe: DWM's COverlayContext::OverlayPlaneInfo::IsDFlipOnMPO
+// calls OverlaysEnabled and then relies on r8 surviving the call (the compiler did interprocedural
+// register allocation, knowing the real callee only touches rcx/al). A C++ detour clobbers r8, which
+// crashed DWM (INVALID_POINTER_READ in IsDFlipOnMPO) during fullscreen-overlay evaluation. The hook is
+// still installed on older builds (24H2 / 23H2 / Win10), which we have not verified, so as not to
+// change their behavior.
 typedef bool (COverlayContext_OverlaysEnabled_t)(void*);
 
 COverlayContext_OverlaysEnabled_t* COverlayContext_OverlaysEnabled_orig  = NULL;
@@ -1963,8 +1972,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 					LOG_ONLY_ONCE("FAILED to find g_pOverlayTestMode")
 				}
 
-				MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)COverlayContext_OverlaysEnabled_hook,
-				              (PVOID*)&COverlayContext_OverlaysEnabled_orig);
+				// OverlaysEnabled: install the hook ONLY on older builds. On 25H2 (>= 26200.8246) it is
+				// redundant (OverlayTestMode=5 already forces a false return) and it crashed DWM by
+				// clobbering r8 that IsDFlipOnMPO relies on across the call, so it is skipped there.
+				if (!isWindows11_25h2)
+					MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)COverlayContext_OverlaysEnabled_hook,
+					              (PVOID*)&COverlayContext_OverlaysEnabled_orig);
 				if (CDeviceManager_ProcessDeviceLost_orig)
 					MH_CreateHook((PVOID)CDeviceManager_ProcessDeviceLost_orig, (PVOID)CDeviceManager_ProcessDeviceLost_hook,
 					              (PVOID*)&CDeviceManager_ProcessDeviceLost_orig);
