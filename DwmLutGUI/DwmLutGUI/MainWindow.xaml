@@ -5,10 +5,13 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:DwmLutGUI"
         mc:Ignorable="d"
-        Title="DwmLutGUI" Height="365" Width="600" MinHeight="200" MinWidth="300">
+        Title="DwmLutGUI" Height="365" Width="965" MinHeight="200" MinWidth="300">
     <Window.DataContext>
         <local:MainViewModel />
     </Window.DataContext>
+    <Window.Resources>
+        <local:LutFileNameConverter x:Key="LutFileName" />
+    </Window.Resources>
     <DockPanel Background="{StaticResource BackgroundBrush}">
         <StatusBar DockPanel.Dock="bottom">
             <TextBlock Text="{Binding ActiveText, StringFormat=Status: {0}}" />
@@ -46,7 +49,10 @@
                 <Button Grid.Row="1" IsEnabled="{Binding HdrLutPath, TargetNullValue=false}" Grid.Column="3"
                         Content="Clear"
                         Width="75" Click="HdrLutClear_Click" />
-                <ComboBox x:Name="ToggleKeyCombo" Grid.Row="2" Grid.Column="0" Text="Toggle Key" SelectedItem="{Binding ToggleKey}" />
+                <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="4" Orientation="Horizontal" Margin="0,6,0,0">
+                    <TextBlock Text="Apply/Disable hotkey" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <ComboBox x:Name="ToggleKeyCombo" SelectedItem="{Binding ToggleKey}" MinWidth="120" />
+                </StackPanel>
             </Grid>
             <Grid DockPanel.Dock="Bottom">
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
@@ -68,56 +74,61 @@
                     <DataGridTextColumn Header="Connector" Binding="{Binding Connector}" IsReadOnly="True" />
                     <DataGridTextColumn Header="Position" Binding="{Binding Position}" IsReadOnly="True" />
                     <DataGridTextColumn Header="Mode" Binding="{Binding HdrStatus}" IsReadOnly="True" />
-                    <DataGridTemplateColumn Header="SDR LUT" Width="*" IsReadOnly="False">
+                    <DataGridTextColumn Header="Status" Binding="{Binding Status}" IsReadOnly="True" />
+                    <DataGridTemplateColumn Header="SDR LUT" Width="*" IsReadOnly="True">
                         <DataGridTemplateColumn.CellTemplate>
                             <DataTemplate>
-                                <TextBlock Text="{Binding SdrLutFilename, Mode=OneWay}" />
-                            </DataTemplate>
-                        </DataGridTemplateColumn.CellTemplate>
-                        <DataGridTemplateColumn.CellEditingTemplate>
-                            <DataTemplate>
-                                <ComboBox ItemsSource="{Binding SdrLuts}" SelectedItem="{Binding SdrLutPath, UpdateSourceTrigger=PropertyChanged}">
+                                <ComboBox ItemsSource="{Binding SdrLuts}"
+                                          SelectedItem="{Binding SdrLutPath, UpdateSourceTrigger=PropertyChanged}"
+                                          ToolTip="Select an SDR LUT for this monitor (empty = none)">
                                     <ComboBox.ItemTemplate>
                                         <DataTemplate>
-                                            <TextBlock Text="{Binding}" />
+                                            <TextBlock Text="{Binding Converter={StaticResource LutFileName}}" />
                                         </DataTemplate>
                                     </ComboBox.ItemTemplate>
                                 </ComboBox>
                             </DataTemplate>
-                        </DataGridTemplateColumn.CellEditingTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
-                    <DataGridTemplateColumn>
-                        <DataGridTemplateColumn.HeaderTemplate>
+                    <DataGridTemplateColumn Header="SDR LUT actions">
+                        <DataGridTemplateColumn.CellTemplate>
                             <DataTemplate>
-                                <Button Content="-" Click="RemoveSdrLut_Click" />
+                                <StackPanel Orientation="Horizontal">
+                                    <Button Content="NXT" Click="SwitchSdrLut_Click"
+                                            ToolTip="Cycle this monitor to its next SDR LUT" />
+                                    <Button Content="DEL" Click="DeleteSdrLut_Click" Margin="4,0,0,0"
+                                            ToolTip="Remove the current SDR LUT from this monitor's list" />
+                                </StackPanel>
                             </DataTemplate>
-                        </DataGridTemplateColumn.HeaderTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
                     
-                    <DataGridTemplateColumn Header="HDR LUT" Width="*" IsReadOnly="False">
+                    <DataGridTemplateColumn Header="HDR LUT" Width="*" IsReadOnly="True">
                         <DataGridTemplateColumn.CellTemplate>
                             <DataTemplate>
-                                <TextBlock Text="{Binding HdrLutFilename, Mode=OneWay}" />
-                            </DataTemplate>
-                        </DataGridTemplateColumn.CellTemplate>
-                        <DataGridTemplateColumn.CellEditingTemplate>
-                            <DataTemplate>
-                                <ComboBox ItemsSource="{Binding HdrLuts}" SelectedItem="{Binding HdrLutPath, UpdateSourceTrigger=PropertyChanged}">
+                                <ComboBox ItemsSource="{Binding HdrLuts}"
+                                          SelectedItem="{Binding HdrLutPath, UpdateSourceTrigger=PropertyChanged}"
+                                          ToolTip="Select an HDR LUT for this monitor (empty = none)">
                                     <ComboBox.ItemTemplate>
                                         <DataTemplate>
-                                            <TextBlock Text="{Binding}" />
+                                            <TextBlock Text="{Binding Converter={StaticResource LutFileName}}" />
                                         </DataTemplate>
                                     </ComboBox.ItemTemplate>
                                 </ComboBox>
                             </DataTemplate>
-                        </DataGridTemplateColumn.CellEditingTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
-                    <DataGridTemplateColumn>
-                        <DataGridTemplateColumn.HeaderTemplate>
+                    <DataGridTemplateColumn Header="HDR LUT actions">
+                        <DataGridTemplateColumn.CellTemplate>
                             <DataTemplate>
-                                <Button Content="-" Click="RemoveHdrLut_Click" />
+                                <StackPanel Orientation="Horizontal">
+                                    <Button Content="NXT" Click="SwitchHdrLut_Click"
+                                            ToolTip="Cycle this monitor to its next HDR LUT" />
+                                    <Button Content="DEL" Click="DeleteHdrLut_Click" Margin="4,0,0,0"
+                                            ToolTip="Remove the current HDR LUT from this monitor's list" />
+                                </StackPanel>
                             </DataTemplate>
-                        </DataGridTemplateColumn.HeaderTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
                 </DataGrid.Columns>
             </DataGrid>

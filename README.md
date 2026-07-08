@@ -30,7 +30,8 @@ Right now it should work on 23H2 (build 22631), 24H2 and 25H2 builds >= 26200.82
 - **Crash-resilient across display-mode changes:** Fullscreen apps that switch resolution (e.g. classic DirectDraw games) force DWM to tear down and recreate its graphics device. This fork releases its LUT resources at the exact moment DWM does so, so DWM doesn't crash, and the LUT is restored automatically on exit.
 - **Version-keyed build profiles:** Every supported `dwmcore.dll` build's signatures and offsets live in one self-contained table entry keyed by version, so adapting to a future Windows update is a single localized change.
 - **Fail-safe by design:** A process-wide kill-switch and structured-exception boundaries around the render path keep any failure contained; DWM composites normally instead of crash-looping.
-- **MPO / DirectFlip Management**: Automated `OverlayTestMode` handling so *windowed → borderless → direct-fullscreen-composition* transitions keep working, with correct per-adapter/per-output resource allocation/deallocation. LUTs apply to composited surfaces (windowed apps, most fullscreen video, and legacy fullscreen games). **Fullscreen or borderless games that DWM promotes to IndependentFlip (direct scanout) bypass composition and will not show the LUT**; this is a DWM limitation with no compositor-side hook on 25H2. For those, an in-game overlay such as [ImGui](https://github.com/ocornut/imgui) is the right approach.
+- **MPO / DirectFlip Management**: Automated `OverlayTestMode` handling for *windowed -> borderless -> direct-fullscreen-composition* transitions, plus a **composition-blocker overlay** that (only when a fullscreen app is detected on a monitor with an applicable LUT) forces that display to composite so the LUT applies to fullscreen/borderless apps that would otherwise IndependentFlip. Per-monitor, DPI-correct, and removed as soon as fullscreen ends. In summary, LUTs apply to composited surfaces (windowed apps, most fullscreen video, and legacy fullscreen games). **Fullscreen or borderless games that DWM promotes to IndependentFlip (direct scanout) bypass composition and will not show the LUT**; this is a DWM limitation with no compositor-side hook on 25H2. For those, an in-game overlay such as [ImGui](https://github.com/ocornut/imgui) is the right approach.
+- **Improved UI**: In-grid SDR/HDR LUT dropdowns per monitor with NXT (cycle) / DEL (remove) actions, a live per-monitor Status (inactive / active windowed / active fullscreen), and a global Apply/Disable hotkey.
 - **Enhanced .cube Parser**: Support for DisplayCAL generated LUTs, including negative values and floating-point data.
 
 ## Usage
@@ -64,4 +65,4 @@ See [documentation](DOCUMENTATION.md) for technical info and known limitations.
 
 ---
 
-*Last Updated: 07 July 2026*
+*Last Updated: 08 July 2026*

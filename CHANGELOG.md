@@ -8,6 +8,36 @@ This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246** and **10.0
 ---
 ---
 
+## v1.1.0
+
+### C# UI — `DwmLutGUI`
+
+#### Fullscreen-game LUT via a composition-blocker overlay
+- **New:** while LUTs are active, a per-monitor, click-through, almost-transparent (non-zero-alpha) topmost overlay is placed on a display **only when a fullscreen app is covering it**, which forces DWM to composite that surface instead of promoting it to IndependentFlip / a hardware overlay plane. So the LUT applies to fullscreen/borderless apps that would otherwise bypass composition. The overlay is created only when fullscreen is detected on an applicable-LUT monitor and removed the moment it isn't (a ~400 ms watcher, `WindowInteropHelper` / `EnumWindows` based, foreground-independent).
+- Overlays are positioned in **true physical pixels** (`EnumDisplayMonitors` + `SetWindowPos` under a Per-Monitor-v2 DPI context evaluated off the UI thread), so coverage is exact on mixed-DPI multi-monitor layouts. Exclusive-fullscreen apps still bypass DWM entirely and cannot be reached (documented limit).
+
+#### DPI-correct Apply-time repaint
+- **Was:** `RedrawScreens` spanned a single window across `Screen.AllScreens` bounds, which are expressed in the primary monitor's DPI units and therefore wrong on mixed-DPI setups, so a monitor could keep its pre-LUT pixels until dirtied by the cursor/a window ("wipe-in").
+- **Is:** it now flashes a brief repaint per monitor sized in **true physical pixels**, forcing a full
+  re-composite on every display regardless of scaling.
+
+#### New "Status" column
+- Each monitor row shows a live status: `Inactive` / `Active, windowed mode` / `Active, fullscreen mode`, updated by the same watcher.
+
+#### In-cell LUT ComboBoxes + per-row actions
+- The **SDR LUT** / **HDR LUT** cells are now always-visible ComboBoxes listing that monitor's LUTs (filename shown; empty when the list is empty or none is selected). Selecting a LUT applies and persists it as before.
+- New **"SDR/HDR LUT actions"** columns with per-row **`NXT`** (cycle to the next LUT in that monitor's list; nothing with fewer than two) and **`DEL`** (remove the selected LUT from the list; if it was applied, unapply and stay disabled). Both operate on the ComboBox's current selection, and the ComboBox follows programmatic changes.
+
+#### Apply/Disable hotkey
+- The global toggle key (labeled **"Apply/Disable hotkey"**) now toggles Apply/Disable instead of cycling per-monitor LUTs: it disables if active, otherwise applies. The handler reads the bound key (null-safe; `None` = no hotkey) and the key dropdown now displays its current value correctly.
+
+#### `MainViewModel.cs`
+- **HDR LUT list now persists.** `SaveConfig` wrote `<sdr_luts>` but not `<hdr_luts>` (the loader already read it), so per-monitor HDR LUT lists were lost across restarts. The `<hdr_luts>` block is now written.
+- **Missing LUTs are pruned on load.** LUT files that no longer exist (deleted, or on a disconnected drive whose letter doesn't resolve) are dropped from each monitor's list, and a current selection whose file is missing is cleared.
+
+---
+---
+
 ## v1.0.3
 
 ### C++ injector — `lutdwm/dllmain.cpp`
@@ -164,4 +194,4 @@ This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246** and **10.0
 
 ---
 
-*Last Updated: 07 July 2026*
+*Last Updated: 08 July 2026*

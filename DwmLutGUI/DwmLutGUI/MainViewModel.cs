@@ -82,6 +82,15 @@ namespace DwmLutGUI
             _configChanged = _lastConfig != _activeConfig && !XNode.DeepEquals(_lastConfig, _activeConfig);
         }
 
+        // A LUT path is "usable" if it is empty/None (no LUT) or the file actually exists. Files that
+        // are gone (deleted, or on a disconnected drive whose letter no longer resolves) are treated as
+        // missing so they can be pruned rather than lingering in the list or being applied.
+        private static bool LutFileOk(string path) =>
+            string.IsNullOrEmpty(path) || path == "None" || File.Exists(path);
+
+        private static System.Collections.Generic.List<string> PruneMissing(System.Collections.Generic.List<string> paths) =>
+            paths?.Where(p => !string.IsNullOrEmpty(p) && File.Exists(p)).ToList();
+
         private void SaveConfig()
         {
             if (_allMonitors.Count == 0)
@@ -108,6 +117,11 @@ namespace DwmLutGUI
                                     ? new XElement("sdr_luts",
                                         x.SdrLuts.Where(s => !string.IsNullOrEmpty(s))
                                                  .Select(s => new XElement("sdr_lut", s)))
+                                    : null,
+                                x.HdrLuts != null
+                                    ? new XElement("hdr_luts",
+                                        x.HdrLuts.Where(s => !string.IsNullOrEmpty(s))
+                                                 .Select(s => new XElement("hdr_lut", s)))
                                     : null)));
 
                 xElem.Save(_configPath);
@@ -285,6 +299,11 @@ namespace DwmLutGUI
                 }
                 var sdrLutPaths = settings?.Element("sdr_luts")?.Elements("sdr_lut").Select(x => (string)x).ToList();
                 var hdrLutPaths = settings?.Element("hdr_luts")?.Elements("hdr_lut").Select(x => (string)x).ToList();
+                // Prune LUTs whose file no longer exists on disk, and clear a current selection that is missing.
+                sdrLutPaths = PruneMissing(sdrLutPaths);
+                hdrLutPaths = PruneMissing(hdrLutPaths);
+                if (!LutFileOk(sdrLutPath)) sdrLutPath = null;
+                if (!LutFileOk(hdrLutPath)) hdrLutPath = null;
                 var monitor = new MonitorData(devicePath, path.DisplaySource.SourceId + 1, name, connector, position,
                     sdrLutPath, hdrLutPath)
                 {
@@ -310,6 +329,10 @@ namespace DwmLutGUI
 
                     var sdrLutPaths = monitor.Element("sdr_luts")?.Elements("sdr_lut").Select(x => (string)x).ToList();
                     var hdrLutPaths = monitor.Element("hdr_luts")?.Elements("hdr_lut").Select(x => (string)x).ToList();
+                    sdrLutPaths = PruneMissing(sdrLutPaths);
+                    hdrLutPaths = PruneMissing(hdrLutPaths);
+                    if (!LutFileOk(sdrLutPath)) sdrLutPath = null;
+                    if (!LutFileOk(hdrLutPath)) hdrLutPath = null;
                     var newMonitorData = new MonitorData(path, sdrLutPath, hdrLutPath) { DisplayIndex = 0 };
                     if (sdrLutPaths != null) newMonitorData.SdrLuts = new ObservableCollection<string>(sdrLutPaths);
                     if (hdrLutPaths != null) newMonitorData.HdrLuts = new ObservableCollection<string>(hdrLutPaths);

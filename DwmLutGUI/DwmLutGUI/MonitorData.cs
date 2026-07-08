@@ -56,6 +56,20 @@ namespace DwmLutGUI
         public bool IsHdr { get; set; }                    // display currently in HDR (advanced color) mode
         public string HdrStatus => IsHdr ? "HDR" : "SDR";  // shown in the monitor list "Mode" column
 
+        // Live per-monitor state for the "Status" column, pushed by the composition-blocker watcher:
+        // "Inactive" / "Active, windowed mode" / "Active, fullscreen mode".
+        private string _status = "Inactive";
+        public string Status
+        {
+            get => _status;
+            set
+            {
+                if (_status == value) return;
+                _status = value;
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Status)));
+            }
+        }
+
         public ObservableCollection<string> SdrLuts { get; set; }
         public ObservableCollection<string> HdrLuts { get; set; }
 
@@ -68,6 +82,7 @@ namespace DwmLutGUI
                 if (value != "None" && !SdrLuts.Contains(value))
                     SdrLuts.Add(value);
                 _sdrLutPath = value != "None" ? value : null;
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(SdrLutPath)));       // update the LUT ComboBox selection
                 PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(SdrLutFilename)));
                 StaticPropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(SdrLutFilename)));
             }
@@ -83,6 +98,7 @@ namespace DwmLutGUI
                 if (value != "None" && !HdrLuts.Contains(value))
                     HdrLuts.Add(value);
                 _hdrLutPath = value != "None" ? value : null;
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HdrLutPath)));       // update the LUT ComboBox selection
                 PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HdrLutFilename)));
                 StaticPropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HdrLutFilename)));
             }
