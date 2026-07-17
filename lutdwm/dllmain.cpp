@@ -269,6 +269,33 @@ int COverlayContext_DeviceClipBox_offset_w11 = 0x466C;
 
 const int IOverlaySwapChain_HardwareProtected_offset_w11 = -0x144;
 
+// --- Windows 11 21H2 (build 22000-22620) -----------------------------------------------------------
+// These are ledoge's original 21H2 signatures/offsets (dwm_lut 3.8), which lauralex REPLACED with the
+// 22H2/23H2 values above. 21H2 differs structurally from 22H2/23H2: DeviceClipBox is read directly from
+// the context (no extra deref, see GetLUTDataFromCOverlayContext) and the IDXGISwapChain pointer is a
+// plain offset (no "sub_from_legacy_swapchain" indirection). Signatures are concrete (no wildcards), so
+// they are matched with memcmp exactly as ledoge did. The match-point adjustments are ledoge's:
+// Present at (address - 0xf), IsCandidate at the 2nd match (address), OverlaysEnabled at (address - 0x7).
+const unsigned char COverlayContext_Present_bytes_w11_21h2[] = {
+	0x48, 0x33, 0xC4, 0x48, 0x89, 0x44, 0x24, 0x50, 0x48, 0x8B, 0xB1, 0xA0, 0x2B, 0x00, 0x00, 0x48, 0x8B, 0xFA,
+	0x48, 0x8B, 0xD9, 0x48, 0x85, 0xF6
+};
+const int IOverlaySwapChain_IDXGISwapChain_offset_w11_21h2 = -0x148;
+
+const unsigned char COverlayContext_IsCandidateDirectFlipCompatible_bytes_w11_21h2[] = {
+	0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8B, 0xEC, 0x48, 0x83,
+	0xEC, 0x68
+};
+
+const unsigned char COverlayContext_OverlaysEnabled_bytes_w11_21h2[] = {
+	0x74, 0x09, 0x83, 0x79, 0x2C, 0x01, 0x0F, 0x97, 0xC0, 0xC3, 0xCC, 0x32, 0xC0, 0xC3
+};
+
+// Mutable: bumped by +8 at load time when UBR >= 706 (ledoge's late-21H2 revision fixup).
+int COverlayContext_DeviceClipBox_offset_w11_21h2 = 0x462C;
+
+const int IOverlaySwapChain_HardwareProtected_offset_w11_21h2 = -0xEC;
+
 const unsigned char COverlayContext_Present_bytes_w11_24h2[] = {
 	0x4C, 0x8B, 0xDC, 0x56, 0x41, 0x56
 };
@@ -400,7 +427,8 @@ static const DwmProfile* SelectDwmProfile(unsigned long long ver)
 }
 
 bool isWindows11 = false;
-bool isWindows11_23h2 = false;
+bool isWindows11_21h2 = false;   // Windows 11 21H2 (build 22000-22620): ledoge-era layout, distinct from 22H2/23H2
+bool isWindows11_22h2_23h2 = false;
 bool isWindows11_24h2 = false;
 bool isWindows11_25h2 = false;
 unsigned long long g_dwmcoreVersion = 0; // (build<<32)|revision of the loaded dwmcore.dll
@@ -810,9 +838,19 @@ lutData* GetLUTDataFromCOverlayContext(void* context, bool hdr, int* out_index)
 			gotCoords = true;
 		}
 	}
-	else if (isWindows11_23h2 || isWindows11)
+	else if (isWindows11_21h2)
 	{
-		// 23H2 / Windows 11: DeviceClipBox at *(void**)self + 0x466C (float RECT).
+		// 21H2: DeviceClipBox read DIRECTLY from the context (no extra deref) at self + 0x462C (float
+		// RECT) -- ledoge's original scheme. 22H2/23H2 (below) changed this to *(void**)self + 0x466C.
+		if (ReadRect(context, 0, COverlayContext_DeviceClipBox_offset_w11_21h2, RK_FLOAT, r))
+		{
+			left = r[0]; top = r[1];
+			gotCoords = true;
+		}
+	}
+	else if (isWindows11_22h2_23h2 || isWindows11)
+	{
+		// 22H2 / 23H2 / Windows 11: DeviceClipBox at *(void**)self + 0x466C (float RECT).
 		if (ReadRect(context, 1, COverlayContext_DeviceClipBox_offset_w11, RK_FLOAT, r))
 		{
 			left = r[0]; top = r[1];
@@ -822,8 +860,10 @@ lutData* GetLUTDataFromCOverlayContext(void* context, bool hdr, int* out_index)
 	}
 	else
 	{
-		// Windows 10 / older: DeviceClipBox at *(void**)self - 0x120 (float RECT).
-		if (ReadRect(context, 1, COverlayContext_DeviceClipBox_offset, RK_FLOAT, r))
+		// Windows 10: DeviceClipBox read DIRECTLY from the context at self - 0x120, as an INT RECT --
+		// ledoge's original scheme. (22H2/23H2/24H2 above use a dereferenced float RECT; 21H2 and 25H2
+		// read directly. Reading this int RECT as float, or via an extra deref, yields a garbage origin.)
+		if (ReadRect(context, 0, COverlayContext_DeviceClipBox_offset, RK_INT, r))
 		{
 			left = r[0]; top = r[1];
 			gotCoords = true;
@@ -1403,7 +1443,9 @@ long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned i
 		LOG_ONLY_ONCE("I am inside COverlayContext::Present hook inside the main if condition")
 
 		bool hwProtected = false;
-		if (isWindows11)
+		if (isWindows11_21h2)
+			hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11_21h2);
+		else if (isWindows11)
 			hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11);
 		else
 			hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset);
@@ -1417,7 +1459,14 @@ long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned i
 		{
 			IDXGISwapChain* swapChain;
 
-			if (isWindows11)
+			if (isWindows11_21h2)
+			{
+				LOG_ONLY_ONCE("Gathering IDXGISwapChain pointer")
+				// 21H2: plain offset into overlaySwapChain (ledoge) -- NO sub_from_legacy indirection.
+				swapChain = *(IDXGISwapChain**)((unsigned char*)overlaySwapChain +
+					IOverlaySwapChain_IDXGISwapChain_offset_w11_21h2);
+			}
+			else if (isWindows11)
 			{
 				LOG_ONLY_ONCE("Gathering IDXGISwapChain pointer")
 				int sub_from_legacy_swapchain = *(int*)((unsigned char*)overlaySwapChain - 4);
@@ -1643,10 +1692,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			ULONGLONG dwlConditionMask = 0;
 			VER_SET_CONDITION(dwlConditionMask, VER_BUILDNUMBER, VER_GREATER_EQUAL);
 
+			OSVERSIONINFOEX versionInfo22h2;
+			ZeroMemory(&versionInfo22h2, sizeof OSVERSIONINFOEX);
+			versionInfo22h2.dwOSVersionInfoSize = sizeof OSVERSIONINFOEX;
+			versionInfo22h2.dwBuildNumber = 22621;
+
 			OSVERSIONINFOEX versionInfo23h2;
 			ZeroMemory(&versionInfo23h2, sizeof OSVERSIONINFOEX);
 			versionInfo23h2.dwOSVersionInfoSize = sizeof OSVERSIONINFOEX;
-			versionInfo23h2.dwBuildNumber = 22621;
+			versionInfo23h2.dwBuildNumber = 22631;
 
 			if (VerifyVersionInfo(&versionInfo25h2, VER_BUILDNUMBER, dwlConditionMask))
 			{
@@ -1656,13 +1710,21 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			{
 				isWindows11_24h2 = true;
 			}
-			else if (VerifyVersionInfo(&versionInfo23h2, VER_BUILDNUMBER, dwlConditionMask))
+			else if (VerifyVersionInfo(&versionInfo22h2, VER_BUILDNUMBER, dwlConditionMask) ||
+				VerifyVersionInfo(&versionInfo23h2, VER_BUILDNUMBER, dwlConditionMask))
 			{
-				isWindows11_23h2 = true;
+				// 22H2 (22621) and 23H2 (22631) share the same DWM layout, so they drive one tier/flag.
+				// With VER_GREATER_EQUAL this OR is currently equivalent to the 22621 check alone; naming
+				// both builds documents the range and makes it trivial to split the branch should their
+				// offsets ever diverge.
+				isWindows11_22h2_23h2 = true;
 				isWindows11 = true;
 			}
 			else if (VerifyVersionInfo(&versionInfo, VER_BUILDNUMBER, dwlConditionMask))
 			{
+				// build >= 22000 but < 22621 -> Windows 11 21H2. Keep isWindows11 set too, so any code
+				// path without a dedicated 21H2 branch falls back to 22H2/23H2 handling rather than W10.
+				isWindows11_21h2 = true;
 				isWindows11 = true;
 			}
 			else
@@ -1822,6 +1884,56 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 					{
 						break;
 					}
+				}
+			}
+			else if (isWindows11_21h2)
+			{
+				// 21H2 (ledoge's dwm_lut 3.8 scan). Signatures are concrete (no wildcards) so they are
+				// matched with memcmp exactly as ledoge did, with ledoge's match-point adjustments:
+				// Present at (address - 0xf), IsCandidate at the 2nd match, OverlaysEnabled at (address - 0x7).
+				// g_pOverlayTestMode is intentionally left NULL: ledoge never forced OverlayTestMode (and the
+				// 21H2 OverlaysEnabled signature is the function body, not the OverlayTestMode-cmp instruction
+				// that the 22H2/23H2 path derives the global from).
+				int found_isCandidate_21h2 = 0;
+				for (size_t i = 0; i <= moduleInfo.SizeOfImage - sizeof(COverlayContext_Present_bytes_w11_21h2); i++)
+				{
+					unsigned char* address = (unsigned char*)dwmcore + i;
+					if (!COverlayContext_Present_orig &&
+						!memcmp(address, COverlayContext_Present_bytes_w11_21h2,
+							sizeof(COverlayContext_Present_bytes_w11_21h2)))
+					{
+						COverlayContext_Present_orig = (COverlayContext_Present_t*)(address - 0xf);
+						COverlayContext_Present_real_orig = COverlayContext_Present_orig;
+					}
+					else if (!COverlayContext_IsCandidateDirectFlipCompatible_orig &&
+						!memcmp(address, COverlayContext_IsCandidateDirectFlipCompatible_bytes_w11_21h2,
+							sizeof(COverlayContext_IsCandidateDirectFlipCompatible_bytes_w11_21h2)))
+					{
+						found_isCandidate_21h2++;
+						if (found_isCandidate_21h2 == 2)
+							COverlayContext_IsCandidateDirectFlipCompatible_orig =
+								(COverlayContext_IsCandidateDirectFlipCompatible_t*)address;
+					}
+					else if (!COverlayContext_OverlaysEnabled_orig &&
+						!memcmp(address, COverlayContext_OverlaysEnabled_bytes_w11_21h2,
+							sizeof(COverlayContext_OverlaysEnabled_bytes_w11_21h2)))
+					{
+						COverlayContext_OverlaysEnabled_orig = (COverlayContext_OverlaysEnabled_t*)(address - 0x7);
+					}
+					if (COverlayContext_Present_orig && COverlayContext_IsCandidateDirectFlipCompatible_orig &&
+						COverlayContext_OverlaysEnabled_orig)
+					{
+						break;
+					}
+				}
+
+				// Late-21H2 revision fixup (ledoge): UBR >= 706 shifts DeviceClipBox by +8.
+				DWORD rev = 0;
+				DWORD revSize = sizeof(rev);
+				if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "UBR",
+					RRF_RT_DWORD, NULL, &rev, &revSize) == ERROR_SUCCESS && rev >= 706)
+				{
+					COverlayContext_DeviceClipBox_offset_w11_21h2 += 8;
 				}
 			}
 			else if (isWindows11)

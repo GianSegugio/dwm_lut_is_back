@@ -3,7 +3,27 @@
 ## Note on environment tuning
 
 Since the switch to the Windows 11 Germanium Platform, DWM internals got updated and [lauralex/dwm_lut](https://github.com/lauralex/dwm_lut) was not working anymore. As for [ed1ii/dwm_lut_fixed](https://github.com/ed1ii/dwm_lut_fixed) it was developed to bring support up to 25H2 (Canary), but newer 25H2 builds broke DwmLut again.  
-This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246** and **10.0.26100.8655** (Windows 11 25H2, builds 26200.8246 and 26200.8655), ImageBase `0x180000000`. All signatures/offsets are valid for those 25H2 binaries, thus the tool is not guaranteed to work on older 25H2 builds for which LUT application is skipped entirely as a safety measure. Support for 24H2 (direct composition), and 23H2 (build 22631) has been kept, but no evaluation has been conducted for such legacy versions.
+This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246** and **10.0.26100.8655** (Windows 11 25H2, builds 26200.8246 and 26200.8655), ImageBase `0x180000000`. All signatures/offsets are valid for those 25H2 binaries, thus the tool is not guaranteed to work on older 25H2 builds for which LUT application is skipped entirely as a safety measure. Support for older Windows versions has been kept, but no evaluation has been conducted for such legacy ones.
+
+---
+---
+
+## v1.1.1
+
+### C++ injector — `lutdwm/dllmain.cpp`
+
+#### Dedicated Windows 11 21H2 support tier (build 22000–22620)
+- **Was:** builds in the 21H2 range were folded into the 22H2/23H2 code path, so they used the wrong `DeviceClipBox` / `IDXGISwapChain` / `HardwareProtected` offsets **and** the wrong addressing — 22H2/23H2 dereferences the context for the clip box (`*(void**)self + 0x466C`) and resolves the swapchain pointer through the `sub_from_legacy_swapchain` indirection. On 21H2 that mismatch misidentifies monitors and/or fails to apply the LUT.
+- **Is:** 21H2 now has its own tier carrying [ledoge/dwm_lut](https://github.com/ledoge/dwm_lut)'s original 21H2 signatures and offsets: `DeviceClipBox` read **directly** from the context at `self + 0x462C` (float RECT; `+8` when UBR ≥ 706), `IDXGISwapChain` at the **plain** offset `-0x148` (no indirection), `HardwareProtected` at `-0xEC`. It is selected via `VerifyVersionInfo` (build ≥ 22000 and < 22621) and kept fully separate from the 22H2/23H2 path; any 21H2 build sets both the 21H2 flag *and* the generic Windows-11 flag, so a hypothetical un-specialized code path falls back to 22H2/23H2 behavior rather than to Windows 10.
+- The 21H2 `OverlaysEnabled` hook uses the plain C++ detour (the register-preserving thunk is a 25H2-only need), and — matching ledoge — `OverlayTestMode` is left untouched on 21H2 (ledoge never forced it and worked on 21H2; the 21H2 `OverlaysEnabled` signature is the function body, not the `OverlayTestMode` compare instruction the 22H2/23H2 path derives that global from).
+- Reviewed the other legacy tiers against ledoge/lauralex while adding this one: the 22H2/23H2 offsets (lauralex's) were already correct and are unchanged; the Windows 10 tier needed a correction (see **Windows 10 clip-box read corrected (20H2 / 21H1)**).
+- Inherits the existing safety layer unchanged: the SEH-guarded clip-box read (a bad offset skips the frame instead of crashing DWM), the strict 1:1 context↔origin ownership guard, the process-wide kill switch, and the SEH render boundary. The 25H2-only `ProcessDeviceLost` crash-resilience hook is **not** part of any legacy tier (it needs per-build reverse engineering of each `dwmcore.dll`, which isn't available for these builds).
+- **Not evaluated on hardware.** Like the other sub-25H2 tiers, the 21H2 path is unverified on a real 21H2 machine.
+
+#### Windows 10 clip-box read corrected (20H2 / 21H1)
+- **Was:** the Windows 10 monitor-origin read used the 22H2/23H2 pattern — a **dereferenced float** RECT (`*(void**)self`, read as `RK_FLOAT`) — with only the offset swapped to `-0x120`. ledoge, the only proven Windows 10 implementation, reads `self - 0x120` **directly** (no dereference) as an **int** RECT. Reading integer coordinates as float, through an extra indirection, yields a garbage origin, so Windows 10 monitor identification could not work.
+- **Is:** the Windows 10 branch now matches ledoge exactly — direct read, int RECT. The Windows 10 signatures, base offsets (`IDXGISwapChain -0x118`, `HardwareProtected -0xBC`), swapchain access and install adjustments already matched ledoge and are unchanged.
+- **Not evaluated on hardware.** Corrected against ledoge's source but unverified on a real 20H2 / 21H1 machine.
 
 ---
 ---
@@ -194,4 +214,4 @@ This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246** and **10.0
 
 ---
 
-*Last Updated: 08 July 2026*
+*Last Updated: 17 July 2026*

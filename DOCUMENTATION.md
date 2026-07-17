@@ -5,7 +5,7 @@
 DwmLut is composed of a C++ core (`lutdwm`) and a C# management interface (`DwmLutGUI`).
 
 > **Build target:** this build is tuned for and verified against **`dwmcore.dll` 10.0.26100.8246** and **10.0.26100.8655** (Windows 11 25H2, OS Builds 26200.8246 and 26200.8655). 
-> The per-monitor identification and DWM offsets below are specific to those binaries. Legacy Windows-version detection remains in the code, but correct per-monitor mapping is **not** guaranteed on other builds, see **Known Limitations** for more details.
+> The per-monitor identification and DWM offsets below are specific to those binaries. Legacy Windows-version detection remains in the code, but correct per-monitor mapping is **not** guaranteed on older Windows versions, see **Known Limitations** for more details.
 
 ### 1. The Core Engine (`lutdwm`)
 The core engine is a dynamic link library (`lutdwm.dll`) designed for injection into `dwm.exe` (Desktop Window Manager).
@@ -15,7 +15,7 @@ The core engine is a dynamic link library (`lutdwm.dll`) designed for injection 
 - **LUT Application**: Uses a custom pixel shader to apply 3D LUT data via tetrahedral interpolation.
 - **Dithering**: Implements blue-noise dithering for SDR display modes to maintain bit-depth integrity.
 - **Multi-GPU / Multi-Monitor**: Isolates rendering resources per graphics adapter and per output, and validates every bound resource against the presenting device to keep hybrid iGPU/dGPU setups stable.
-- **Windows Version Handling**: Contains version-detection scaffolding for Windows 10 / Windows 11 (23H2 / 24H2 / 25H2); the active per-monitor coordinate logic is tuned to the **25H2 (26100.8246 / 8655)** layout.
+- **Windows Version Handling**: Contains version-detection scaffolding for Windows 10 / Windows 11 (21H2 / 22H2 / 23H2 / 24H2 / 25H2); the active per-monitor coordinate logic is tuned to the **25H2 (26100.8246 / 8655)** layout.
 
 #### Core Files:
 - `lutdwm/dllmain.cpp`: Main entry point, hooking logic, resource management, and shaders.
@@ -52,7 +52,7 @@ Windows 11 Build 26200 (25H2) significantly refactored DWM's internal structures
 Each overlay composition context reports **local, origin-`(0,0)` coordinates at native resolution** — not its global desktop position — so monitors cannot be told apart by the context's clip rectangle directly. 
 This build reads each monitor's true **desktop origin from `self + 0x7658`** (two floats: `left, top`). Verified behavior: the primary monitor reads `(0, 0)`; a monitor positioned at desktop `x = -1280` reads `left = -1280`. That origin is matched against the position-named `.cube` files, so each context applies its own LUT. A strict 1:1 `context ↔ origin` ownership guard prevents any residual cross-assignment. (The monitor's native resolution is also available at `self + 0x4A24` as an alternate identifier.)
 
-On **24H2 / 23H2 / Windows 10**, the origin is read from that version's own clip-box offset instead — `*(void**)self + 0x53E8` (24H2), `+ 0x466C` (23H2 / Windows 11), or `- 0x120` (Windows 10) — through the same SEH-guarded read. These older paths carry the original ed1ii offsets forward and are supported but unverified on current hardware.
+On **24H2 / 23H2 / 22H2 / 21H2 / Windows 10**, the origin is read from that version's own clip-box offset instead — `*(void**)self + 0x53E8` (24H2), `*(void**)self + 0x466C` (23H2 / 22H2 / Windows 11), `self + 0x462C` read **directly** (21H2 — no extra dereference, ledoge's original scheme), or `self - 0x120` read **directly** as an int RECT (Windows 10 — also ledoge's scheme, no extra dereference) — all through the same SEH-guarded read. The 24H2 offsets are ed1ii's, the 22H2/23H2 offsets are lauralex's, and the 21H2 and Windows 10 offsets (with their direct-read addressing) are ledoge's; all these legacy paths are supported but unverified on current hardware.
 
 ### Backbuffer Acquisition
 DWM no longer exposes an `IDXGISwapChain` through standard patterns. The engine obtains each monitor's composed surface from the **`IOverlaySwapChain`** object by calling `vt[24]`, then `vt[19]` on the returned object, then `QueryInterface(ID3D11Texture2D)` to reach the backbuffer texture. If this cannot resolve a surface, that monitor's frame is skipped. (An earlier brute-force scan that probed arbitrary offsets for a swapchain pointer was removed — it could invoke unintended methods on non-swapchain pointers and destabilize composition.)
@@ -60,7 +60,7 @@ DWM no longer exposes an `IDXGISwapChain` through standard patterns. The engine 
 ### MPO / DirectFlip Suppression
 To ensure the LUT is applied even during DirectFlip or MPO (Multi-Plane Overlays), the engine forces the `OverlayTestMode` global to `5`. The global is resolved via the `COverlayContext::OverlaysEnabled` signature. `COverlayContext::IsCandidateDirectFlipCompatible` is also hooked; note its function prologue is ambiguous on this build (two matches), so the correct instance is disambiguated by its member offset.
 Several finer-grained suppression functions (`CWindowContext`/`CCompSwapChain`/`CCompVisual` candidates) are **inlined** on this build and therefore not hookable as standalone functions; forcing `OverlayTestMode = 5` covers MPO suppression globally in their place.
-On 25H2, `COverlayContext::OverlaysEnabled` is hooked through a small **register-preserving assembly thunk** rather than a direct C++ detour. DWM's `COverlayContext::OverlayPlaneInfo::IsDFlipOnMPO` dereferences `r8` after calling `OverlaysEnabled` and relies on it surviving the call (interprocedural register allocation, since the real callee only touches `rcx`/`al`); a plain detour clobbers `r8` and crashes DWM during fullscreen-overlay evaluation. The thunk (`OverlaysEnabled_thunk`) saves/restores `rcx`/`rdx`/`r8`–`r11` around the hook. Its use is selected per build by the `overlaysEnabledThunk` `DwmProfile` flag; older builds (24H2 / 23H2) use the C++ hook directly.
+On 25H2, `COverlayContext::OverlaysEnabled` is hooked through a small **register-preserving assembly thunk** rather than a direct C++ detour. DWM's `COverlayContext::OverlayPlaneInfo::IsDFlipOnMPO` dereferences `r8` after calling `OverlaysEnabled` and relies on it surviving the call (interprocedural register allocation, since the real callee only touches `rcx`/`al`); a plain detour clobbers `r8` and crashes DWM during fullscreen-overlay evaluation. The thunk (`OverlaysEnabled_thunk`) saves/restores `rcx`/`rdx`/`r8`–`r11` around the hook. Its use is selected per build by the `overlaysEnabledThunk` `DwmProfile` flag; older Windows versions use the C++ hook directly.
 
 ### Fullscreen LUT via a composition-blocker overlay
 A LUT is only applied while DWM composites a surface. Fullscreen/borderless apps are often promoted to IndependentFlip (direct scanout) or a hardware overlay plane, bypassing composition. The GUI counters this from user space: while LUTs are active it watches (~400 ms poll) for a fullscreen app covering an applicable-LUT monitor and, when found, places a full-monitor, click-through, no-activate, almost-invisible (1/255-alpha) topmost window over it. That is "something composited on top", which disqualifies the output from IndependentFlip / overlay promotion and forces composition, so the LUT applies. 
@@ -131,7 +131,7 @@ The handler runs every frame, so this release is gated rather than unconditional
 ## Known Limitations
 
 - **Binary-version lock:** Signatures and offsets are valid for `dwmcore.dll` 10.0.26100.8246 and 10.0.26100.8655 (Windows 11 25H2, builds 26200.8246 and 26200.8655), ImageBase `0x180000000`, thus the tool is not guaranteed to work on older 25H2 builds for which LUT application is skipped entirely as a safety measure. 
-  Support for 24H2 (direct composition), and 23H2 (build 22631) has been kept, but no evaluation has been conducted for such legacy versions.
+  Support for older Windows versions (20H2, 21H1, 21H2, 22H2, 23H2, 24H2) has been kept, but no evaluation has been conducted for such legacy ones.
 - **Crash proof, update vulnerable:** When a Windows update breaks the tool, the symptom points to the cause:
   - *Nothing happens at all* → a `COverlayContext` **signature** moved (most likely `Present`), or the running dwmcore has **no matching profile**.
   - *Wrong monitor / wrong colors* → the clip-box **offset** (`0x7658`) or `GetBackBuffer_25H2`'s `vt[24]`/`vt2[19]` indices moved.
@@ -144,4 +144,4 @@ The handler runs every frame, so this release is gated rather than unconditional
 
 ---
 
-*Last Updated: 08 July 2026*
+*Last Updated: 17 July 2026*
