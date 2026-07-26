@@ -3,7 +3,7 @@
 ## A fork of ed1ii's [dwm_lut_fixed](https://github.com/ed1ii/dwm_lut_fixed) adjusted for **Windows 11 25H2 build >= 26200.8246**
 
 > [!WARNING]
-> **This fork has been developed to add 25H2 support:** it has been validated on a Windows 11 25H2 build 26200.8246 and 26200.8655 fresh installs, with multiple SDR monitors. While there is some support for Windows versions older than 25H2 (read [documentation](DOCUMENTATION.md) for details), the tool is not guaranteed to work on 25H2 builds prior 26200.8246 for which LUT application is skipped entirely as a safety measure. Furthermore keep in mind that any future Windows 11 update may introduce DWM changes that break the current tool configuration.
+> **This fork has been developed to add 25H2 support:** it has been validated on a Windows 11 25H2 build 26200.8246, 26200.8655 and 26200.8875 fresh installs, with multiple SDR monitors. While there is some support for Windows versions older than 25H2 (read [documentation](DOCUMENTATION.md) for details), the tool is not guaranteed to work on 25H2 builds prior 26200.8246 for which LUT application is skipped entirely as a safety measure. Furthermore keep in mind that any future Windows 11 update may introduce DWM changes that break the current tool configuration.
 
 > [!CAUTION]
 > This software injects a DLL into `dwm.exe` and hooks undocumented Windows internals.
@@ -12,7 +12,7 @@
 > Anti-cheat software may detect or reject modification of the Windows graphics pipeline, and some games prohibit color filters that can improve visibility. Disable and close DwmLut before launching competitive or anti-cheat-protected games.
 
 ## Dependencies
-- **Visual C++ runtime:** [AIO Redistributable](https://www.techpowerup.com/download/visual-c-redistributable-runtime-package-all-in-one/)
+- **Visual C++ runtime (recommended):** [AIO Redistributable](https://www.techpowerup.com/download/visual-c-redistributable-runtime-package-all-in-one/)
 
 ## About
 This tool applies 3D LUTs to the Windows desktop by hooking into DWM. It works in both SDR and HDR modes, and uses tetrahedral interpolation on the LUT data. In SDR, blue-noise dithering is applied to the output to reduce banding.
@@ -25,7 +25,7 @@ Right now it should work on 20H2, 21H1, 21H2, 22H2, 23H2, 24H2 and 25H2 builds >
 
 ## Key Features
 
-- **Windows 11 Compatible**: Full support for **25H2 (tested on 26200.8246 and 26200.8655; newer 25H2 builds apply the latest profile)**, support (not tested) for older Windows versions (read [documentation](DOCUMENTATION.md) for details).
+- **Windows 11 Compatible**: Full support for **25H2 (tested on 26200.8246, 26200.8655 and 26200.8875; newer 25H2 builds apply the latest profile)**, support (not tested) for older Windows versions (read [documentation](DOCUMENTATION.md) for details).
 - **Multi-Monitor & Multi-GPU support**: Reliable LUT application across multiple displays and GPUs. Proper discrete GPU and integrated GPU handling with multi-GPU isolation (rendering resources are allocated and validated per graphics adapter and per output).
 - **Crash-resilient across display-mode changes:** Fullscreen apps that switch resolution (e.g. classic DirectDraw games) force DWM to tear down and recreate its graphics device. This fork releases its LUT resources at the exact moment DWM does so, so DWM doesn't crash, and the LUT is restored automatically on exit.
 - **Version-keyed build profiles:** Every supported `dwmcore.dll` build's signatures and offsets live in one self-contained table entry keyed by version, so adapting to a future Windows update is a single localized change.
@@ -53,6 +53,8 @@ Install [vcpkg](https://vcpkg.io/en/getting-started.html) for C++ dependency man
 
 Just open the projects in Visual Studio and compile a x64 Release build.
 
+> The injector links the C++ runtime **statically** (`/MT`, set in `lutdwm.vcxproj`), so `lutdwm.dll` doesn't depend on the target machine's `msvcp140.dll` version. This is deliberate: with a dynamic CRT (`/MD`), a DLL built with the VS2022 17.10+ toolset crashes in `std::mutex` on any machine whose runtime `msvcp140.dll` predates 14.40 (the `constexpr`-mutex ABI change). Leave the Runtime Library on `/MT`. (The Visual C++ Redistributable under **Dependencies** is still worth installing as a general safety net; static linking is what actually protects the injector.)
+
 ## Changelog
 See [changelog](CHANGELOG.md) for new features and differences from ed1ii's [dwm_lut_fixed](https://github.com/ed1ii/dwm_lut_fixed).
 
@@ -65,4 +67,4 @@ See [documentation](DOCUMENTATION.md) for technical info and known limitations.
 
 ---
 
-*Last Updated: 17 July 2026*
+*Last Updated: 26 July 2026*

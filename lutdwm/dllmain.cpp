@@ -27,6 +27,9 @@
 #pragma comment(lib, "version.lib")
 #define LOG_FILE_PATH R"(C:\DWMLOG\dwm.log)"
 #define MAX_LOG_FILE_SIZE 20 * 1024 * 1024
+// Temporary diagnostic: 1 = log loaded LUTs and per-context origin resolution to
+// C:\Windows\Temp\dwm_diag.log (via diag_log, below). Set back to 0 for production builds.
+#define DIAG_MONITOR_MATCH 0
 #ifdef _DEBUG
 #define DEBUG_MODE true
 #else
@@ -118,7 +121,9 @@ using Microsoft::WRL::ComPtr;
 // Always-compiled, crash-proof diagnostic log (SYSTEM-writable). Called only on rare events.
 static void diag_log(const char* msg)
 {
-	return;   // logging disabled — remove this line to re-enable dwm_diag.log
+#if !DIAG_MONITOR_MATCH
+	return;   // logging disabled in production; set DIAG_MONITOR_MATCH=1 to enable dwm_diag.log
+#endif
 	__try
 	{
 		FILE* f = fopen(R"(C:\Windows\Temp\dwm_diag.log)", "a");
@@ -131,6 +136,54 @@ static void diag_log(const char* msg)
 
 // Once set, every hook body returns immediately -> DWM composites normally, never crashes.
 static std::atomic<bool> g_hookInert{false};
+
+#if DIAG_MONITOR_MATCH
+// One-shot per context: scan a window of the COverlayContext for clip-box-shaped RECTs, interpreting
+// each 16-byte candidate as BOTH float and int. Purpose: locate the offset holding the per-monitor
+// *desktop* origin (the field that is (1920,0,3840,1080) for a second monitor at x=1920), as opposed
+// to the monitor-local clip box (always (0,0)-based). Each 16-byte read is SEH-guarded so probing past
+// the object or into unmapped pages can't crash. Runs at most once per distinct context.
+static void DiagScanContextRects(void* context)
+{
+	for (int off = 0x7000; off <= 0x7E00; off += 4)
+	{
+		unsigned int raw[4];
+		bool ok = true;
+		__try
+		{
+			for (int k = 0; k < 4; k++)
+				raw[k] = *reinterpret_cast<volatile unsigned int*>(reinterpret_cast<char*>(context) + off + k * 4);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+		if (!ok) continue;
+
+		// float interpretation
+		float f[4];
+		bool isFloatRect = true;
+		for (int k = 0; k < 4; k++)
+		{
+			f[k] = *reinterpret_cast<float*>(&raw[k]);
+			if (f[k] != (float)(int)f[k] || f[k] < -32768.0f || f[k] > 32768.0f) { isFloatRect = false; break; }
+		}
+		if (isFloatRect)
+		{
+			int l = (int)f[0], t = (int)f[1], r = (int)f[2], b = (int)f[3];
+			if (r > l && b > t && (r - l) >= 320 && (r - l) <= 16384 && (b - t) >= 240 && (b - t) <= 16384)
+			{
+				char bb[192]; snprintf(bb, sizeof(bb), "[ctx %p] fRECT@0x%X = (%d,%d,%d,%d)", context, off, l, t, r, b); diag_log(bb);
+			}
+		}
+
+		// int interpretation
+		int l = (int)raw[0], t = (int)raw[1], r = (int)raw[2], b = (int)raw[3];
+		if (l >= -32768 && l <= 32768 && t >= -32768 && t <= 32768 &&
+			r > l && b > t && (r - l) >= 320 && (r - l) <= 16384 && (b - t) >= 240 && (b - t) <= 16384)
+		{
+			char bb[192]; snprintf(bb, sizeof(bb), "[ctx %p] iRECT@0x%X = (%d,%d,%d,%d)", context, off, l, t, r, b); diag_log(bb);
+		}
+	}
+}
+#endif
 
 #define HR_OR_THROW(expr) do { HRESULT _hr_ = (expr); if (FAILED(_hr_)) throw std::runtime_error(#expr); } while (0)
 
@@ -367,6 +420,27 @@ struct DwmProfile
 // NOTE: signatures are embedded by value, so builds that share the same patterns repeat those bytes.
 static const DwmProfile g_dwmProfiles[] = {
 	// --- add newer dwmcore builds ABOVE (most-recent first) ---
+
+	// Windows 11 25H2 - dwmcore 10.0.26100.8875   (signatures identical to 8655/8246; clip box UNCHANGED at 0x7658, verified on a 2-monitor layout; only the device-vector globals moved)
+	{
+		DWM_VER(26100, 8875),
+		{   // AOB signatures (inline)
+			// COverlayContext::Present
+			{ 0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x6C,
+			  0x24, 0xF9, 0x48, 0x81, 0xEC, 0xF8, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x05,
+			  '?', '?', '?', '?', 0x48, 0x33, 0xC4, 0x48, 0x89, 0x45, 0xEF, 0x4C, 0x8B, 0x65, '?', 0x48, 0x8B, 0xD9 }, 46,
+			// COverlayContext::OverlaysEnabled
+			{ 0x83, 0x3D, '?', '?', '?', '?', 0x05, 0x74, 0x09, 0x83, 0x79, 0x28, 0x01, 0x0F, 0x97, 0xC0, 0xC3 }, 17,
+			// COverlayContext::IsCandidateDirectFlipCompatible
+			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x68, 0x10, 0x48, 0x89, 0x70, 0x18, 0x48,
+			  0x89, 0x78, 0x20, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x20, 0x33, 0xDB }, 27,
+			// CDeviceManager::ProcessDeviceLost (prologue ends in a build-specific lea rcx,[rip+rel32], wildcarded)
+			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x48, 0x08, 0x56,
+			  0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x40, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0x0D, '?', '?', '?', '?' }, 33,
+		},
+		0x7658, 0x3FCC98, 0x3FCCA0, 0x10, 0x458,  // clipBox, vecFirst, vecLast, stride, flag
+		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
+	},
 
 	// Windows 11 25H2 - dwmcore 10.0.26100.8655   (signatures identical to 8246; device-vector globals moved)
 	{
@@ -696,6 +770,9 @@ bool AddLUTs(char* folder)
 					return false;
 				}
 				numLuts++;
+#if DIAG_MONITOR_MATCH
+				{ char b[176]; snprintf(b, sizeof(b), "[LUT loaded] file=%s -> origin=(%d,%d) hdr=%d", fileName, lut->left, lut->top, (int)lut->isHdr); diag_log(b); }
+#endif
 			}
 		}
 	}
@@ -706,8 +783,16 @@ bool AddLUTs(char* folder)
 
 int numLutTargets;
 void** lutTargets;
+// Guards numLutTargets + lutTargets. These are read (IsLUTActive) and reallocated
+// (SetLUTActive / UnsetLUTActive) from the Present hooks, which DWM may run on more than
+// one composition thread at once; an unsynchronized realloc there is a data race that can
+// corrupt the heap. This is a dedicated *leaf* lock — it is only ever held inside the three
+// functions below (none of which call other locking code), so it cannot form a lock-ordering
+// cycle with g_clipMutex / g_adaptersMutex / g_outputsMutex.
+std::mutex g_lutTargetsMutex;
 
-bool IsLUTActive(void* target)
+// Membership test with no locking; the caller must already hold g_lutTargetsMutex.
+static bool IsLUTActive_locked(void* target)
 {
 	for (int i = 0; i < numLutTargets; i++)
 	{
@@ -719,9 +804,16 @@ bool IsLUTActive(void* target)
 	return false;
 }
 
+bool IsLUTActive(void* target)
+{
+	std::lock_guard<std::mutex> lk(g_lutTargetsMutex);
+	return IsLUTActive_locked(target);
+}
+
 void SetLUTActive(void* target)
 {
-	if (!IsLUTActive(target))
+	std::lock_guard<std::mutex> lk(g_lutTargetsMutex);
+	if (!IsLUTActive_locked(target))  // no-lock variant: we already hold the lock
 	{
 		void** _tmp = (void**)realloc(lutTargets, (size_t)(numLutTargets + 1) * sizeof(*lutTargets));
 		if (_tmp)
@@ -734,6 +826,7 @@ void SetLUTActive(void* target)
 
 void UnsetLUTActive(void* target)
 {
+	std::lock_guard<std::mutex> lk(g_lutTargetsMutex);
 	for (int i = 0; i < numLutTargets; i++)
 	{
 		if (lutTargets[i] == target)
@@ -804,6 +897,14 @@ lutData* GetLUTDataFromCOverlayContext(void* context, bool hdr, int* out_index)
 {
 	if (out_index) *out_index = -1;
 	if (!context) return NULL;
+#if DIAG_MONITOR_MATCH
+	// Log the resolve chain once per distinct overlay context (so both monitors show up without spam).
+	static std::mutex g_dbgMtx;
+	static std::map<void*, bool> g_dbgSeen;
+	bool dbgNew;
+	{ std::lock_guard<std::mutex> lk(g_dbgMtx); dbgNew = g_dbgSeen.emplace(context, true).second; }
+	if (dbgNew) DiagScanContextRects(context);
+#endif
 
 	if (g_pOverlayTestMode != NULL)
 		*g_pOverlayTestMode = 5;
@@ -872,11 +973,21 @@ lutData* GetLUTDataFromCOverlayContext(void* context, bool hdr, int* out_index)
 
 	// If the origin can't be read, skip this frame rather than guess (avoids applying a wrong LUT).
 	if (!gotCoords)
+	{
+#if DIAG_MONITOR_MATCH
+		if (dbgNew) { char b[128]; snprintf(b, sizeof(b), "[ctx %p] clip-box read FAILED (hdr=%d) -> skip", context, (int)hdr); diag_log(b); }
+#endif
 		return NULL;
+	}
 
 	// Defensive 1:1 ownership: a context resolving to an origin already owned by another is skipped.
 	if (!ClaimPosition(left, top, context))
+	{
+#if DIAG_MONITOR_MATCH
+		if (dbgNew) { char b[192]; snprintf(b, sizeof(b), "[ctx %p] origin=(%d,%d) hdr=%d -> ClaimPosition REJECTED (this origin is already owned by another context)", context, left, top, (int)hdr); diag_log(b); }
+#endif
 		return NULL;
+	}
 
 	// Exact match only: an HDR context takes an HDR LUT, an SDR context takes an SDR LUT. If the only LUT
 	// for this monitor is the wrong type for its current mode, apply nothing (correct-or-nothing) rather
@@ -884,10 +995,16 @@ lutData* GetLUTDataFromCOverlayContext(void* context, bool hdr, int* out_index)
 	for (int i = 0; i < numLuts; i++)
 		if (luts[i].left == left && luts[i].top == top && luts[i].isHdr == hdr)
 		{
+#if DIAG_MONITOR_MATCH
+			if (dbgNew) { char b[176]; snprintf(b, sizeof(b), "[ctx %p] origin=(%d,%d) hdr=%d -> MATCHED LUT #%d", context, left, top, (int)hdr, i); diag_log(b); }
+#endif
 			if (out_index) *out_index = i;
 			return &luts[i];
 		}
 
+#if DIAG_MONITOR_MATCH
+	if (dbgNew) { char b[208]; snprintf(b, sizeof(b), "[ctx %p] origin=(%d,%d) hdr=%d -> NO MATCHING LUT (%d loaded; filename must be exactly <left>_<top>[_hdr].cube)", context, left, top, (int)hdr, numLuts); diag_log(b); }
+#endif
 	return NULL;
 }
 
@@ -1086,7 +1203,12 @@ void UninitializeStuff()
 	for (int i = 0; i < numLuts; i++)
 		if (luts[i].rawLut) { free(luts[i].rawLut); luts[i].rawLut = NULL; }
 	free(luts);
-	free(lutTargets);
+	{
+		std::lock_guard<std::mutex> lk(g_lutTargetsMutex);
+		free(lutTargets);
+		lutTargets = nullptr;
+		numLutTargets = 0;
+	}
 }
 
 bool RenderLUT(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects,

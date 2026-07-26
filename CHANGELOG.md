@@ -3,7 +3,32 @@
 ## Note on environment tuning
 
 Since the switch to the Windows 11 Germanium Platform, DWM internals got updated and [lauralex/dwm_lut](https://github.com/lauralex/dwm_lut) was not working anymore. As for [ed1ii/dwm_lut_fixed](https://github.com/ed1ii/dwm_lut_fixed) it was developed to bring support up to 25H2 (Canary), but newer 25H2 builds broke DwmLut again.  
-This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246** and **10.0.26100.8655** (Windows 11 25H2, builds 26200.8246 and 26200.8655), ImageBase `0x180000000`. All signatures/offsets are valid for those 25H2 binaries, thus the tool is not guaranteed to work on older 25H2 builds for which LUT application is skipped entirely as a safety measure. Support for older Windows versions has been kept, but no evaluation has been conducted for such legacy ones.
+This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246**, **10.0.26100.8655** and **10.0.26100.8875** (Windows 11 25H2, build 26200.8246, 26200.8655 and 26200.8875), ImageBase `0x180000000`. All signatures/offsets are valid for those 25H2 binaries, thus the tool is not guaranteed to work on older 25H2 builds for which LUT application is skipped entirely as a safety measure. Support for older Windows versions has been kept, but no evaluation has been conducted for such legacy ones.
+
+---
+---
+
+## v1.1.2
+
+### C++ injector — `lutdwm/dllmain.cpp`
+
+#### Windows 11 25H2 — `dwmcore.dll` 10.0.26100.8875 support
+- **New profile row.** 26100.8875 is newer than the last profiled build (8655); without a matching row `SelectDwmProfile` would fall back to the 8655 offsets, whose device-vector globals are stale on 8875, so the per-frame `ProcessDeviceLost` crash-resilience hook would walk the wrong `.data` region. A dedicated `DwmProfile` row for `DWM_VER(26100, 8875)` now sits at the top of `g_dwmProfiles[]` (newest-first, so 8875 matches exactly and any build between 8655 and 8875 still falls to 8655).
+- **RE delta (8875 vs 8655 / 8246):** all four AOB signatures — `Present` `0x231530`, `OverlaysEnabled` `0xA048`, `IsCandidateDirectFlipCompatible` `0x6E1F4`, `ProcessDeviceLost` `0xB3780` — are byte-for-byte identical and still match uniquely, so every hook resolves and installs unchanged. Only the device-vector globals moved: `_Myfirst`/`_Mylast` → `.data` `0x3FCC98`/`0x3FCCA0` (from `0x3FAB78`/`0x3FAB80`). The per-monitor `DeviceClipBox` is **unchanged at `self + 0x7658`**, as are `DeviceInfo` stride `0x10` and lost-flag `0x458`. `OverlayTestMode` and the `Present` security cookie stay RIP-relative (resolved at runtime, no profile fields).
+- **Verification.** Validated on a live 8875 machine: LUTs apply correctly single and dual monitor (each monitor's desktop origin reads correctly at `0x7658`), and fullscreen enter/exit is stable. The device-vector RVAs are static-analysis-derived — the `ProcessDeviceLost` hook runs cleanly across fullscreen mode changes, but that path is SEH-guarded, so a genuine device reset (driver update / TDR with the LUT active) is still the definitive test.
+
+#### Thread-safe LUT-target list — `dllmain.cpp`
+- The active-context list (`lutTargets` / `numLutTargets`) was read and `realloc`-ed from the Present hooks with no synchronization. DWM composites on more than one thread on a multi-GPU system, so two threads could `realloc` the same block at once — a data race that can corrupt the heap. A dedicated `std::mutex` now guards every read, every `realloc`, and the teardown `free`; it is a leaf lock (held only inside those three functions), so it cannot deadlock against the existing adapter / output / clip mutexes. Behavior is unchanged on the common single-composition-thread path.
+
+#### Diagnostics — `dllmain.cpp`
+- Added a compile-time `DIAG_MONITOR_MATCH` switch (default **off**). When set to `1` it logs loaded LUTs, each overlay context's origin / claim / match outcome, and a clip-box-shaped-`RECT` scan of every context to `C:\Windows\Temp\dwm_diag.log` (via the existing `diag_log`) — the tooling that pinned the 8875 clip-box offset against a live two-monitor layout. It compiles out entirely when off.
+
+### Build — `lutdwm/lutdwm.vcxproj`
+
+#### Static C++ runtime (`/MT`) — fixes an `std::mutex` crash on machines with an older VC++ runtime
+- **Symptom.** On some target machines DWM crashed the instant a LUT was applied — `msvcp140!mtx_do_lock` reading a null pointer, reached through the Present hook while locking one of the injector's global `std::mutex` objects.
+- **Root cause.** The project carried no `<RuntimeLibrary>` element, so it inherited the MSBuild default of `MultiThreadedDLL` (`/MD`): the C++ runtime was linked *dynamically* against whatever `msvcp140.dll` is present on the target. Built with a VS2022 17.10+ toolset, the compiler emits the new `constexpr` `std::mutex` layout (its internal pointer left null), which an older runtime's `mtx_do_lock` still dereferences → access violation. Every `std::mutex` lock was a landmine on any machine whose VC++ redistributable predates 14.40.
+- **Fix.** Every configuration now links the CRT statically — `MultiThreaded` (`/MT`) for Release, `MultiThreadedDebug` (`/MTd`) for Debug. The runtime and the matching `std::mutex` implementation are embedded in `lutdwm.dll`, so there is **no dependency on the target's `msvcp140.dll` / VC++ redistributable at all** — the correct model for an injected DLL, and consistent with the `x64-windows-static` vcpkg triplet the project already referenced.
 
 ---
 ---
@@ -214,4 +239,4 @@ This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246** and **10.0
 
 ---
 
-*Last Updated: 17 July 2026*
+*Last Updated: 26 July 2026*
