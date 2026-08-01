@@ -4,7 +4,7 @@
 
 DwmLut is composed of a C++ core (`lutdwm`) and a C# management interface (`DwmLutGUI`).
 
-> **Build target:** this build is tuned for and verified against **`dwmcore.dll` 10.0.26100.8246**, **10.0.26100.8655** and **10.0.26100.8875** (Windows 11 25H2, OS Builds 26200.8246, 26200.8655 and 26200.8875). 
+> **Build target:** this build is tuned for and verified against **`dwmcore.dll` 10.0.26100.8246**, **10.0.26100.8655** and **10.0.26100.8875** (Windows 11 25H2, OS builds 26200.8246 / 8655 / 8875), plus **10.0.26100.8935** (Windows 11 26H2 preview, OS build 26300). Windows 11 21H2 (22000.1880) is also hardware-validated. 
 > The per-monitor identification and DWM offsets below are specific to those binaries. Legacy Windows-version detection remains in the code, but correct per-monitor mapping is **not** guaranteed on older Windows versions, see **Known Limitations** for more details.
 
 ### 1. The Core Engine (`lutdwm`)
@@ -15,7 +15,7 @@ The core engine is a dynamic link library (`lutdwm.dll`) designed for injection 
 - **LUT Application**: Uses a custom pixel shader to apply 3D LUT data via tetrahedral interpolation.
 - **Dithering**: Implements blue-noise dithering for SDR display modes to maintain bit-depth integrity.
 - **Multi-GPU / Multi-Monitor**: Isolates rendering resources per graphics adapter and per output, and validates every bound resource against the presenting device to keep hybrid iGPU/dGPU setups stable.
-- **Windows Version Handling**: Contains version-detection scaffolding for Windows 10 / Windows 11 (21H2 / 22H2 / 23H2 / 24H2 / 25H2); the active per-monitor coordinate logic is tuned to the **25H2 (26100.8246 / 8655 / 8875)** layout.
+- **Windows Version Handling**: Contains version-detection scaffolding for Windows 10 / Windows 11 (21H2 / 22H2 / 23H2 / 24H2 / 25H2 / 26H2); the active per-monitor coordinate logic is tuned to the **25H2 (26100.8246 / 8655 / 8875)** and **26H2 preview (26100.8935)** layouts. The 21H2 tier is hardware-validated.
 
 #### Core Files:
 - `lutdwm/dllmain.cpp`: Main entry point, hooking logic, resource management, and shaders.
@@ -28,12 +28,14 @@ The core engine is a dynamic link library (`lutdwm.dll`) designed for injection 
 A WPF application used to configure and monitor the LUT application status.
 
 #### Key Features:
-- **Per-Monitor Calibration**: Detects all connected monitors and allows assigning a different `.cube` file to each. LUTs are keyed by the monitor's **desktop position** (e.g. `-1280_0.cube`); the "#" column shows a stable, globally-unique display index (independent of per-adapter source IDs).
+- **Per-Monitor Calibration**: Detects all connected monitors and allows assigning a different `.cube` file to each. LUTs are keyed by the monitor's **desktop position** (e.g. `-1280_0.cube`); the "#" row shows a stable, globally-unique display index (independent of per-adapter source IDs).
+- **Comprehensive monitor table**: Properties are rows and each monitor is a column, so the labels read in full and a machine's handful of displays sit side by side. Every column is self-contained — its own SDR and HDR LUT pickers with **Browse / Next / Clear** — so there is no "selected monitor" mode.
 - **Display naming**: Monitor names come from each display's EDID. Internal laptop panels commonly ship an EDID with no product-name descriptor, so they are labelled **"Internal Display"** (detected from the connection type) rather than shown blank; other displays with no EDID name fall back to `???`.
 - **UAC Bypass Autostart**: Uses Windows Task Scheduler to launch with highest privileges on system logon.
 - **DLL Injection**: Automates the `CreateRemoteThread` injection process into `dwm.exe`.
 - **Minimized Operation**: Runs in the system tray to keep LUTs active without cluttering the taskbar.
 - **HDR awareness**: Detects each display's current HDR (advanced-color) state, shows it in the monitor list's **Mode** column, and warns if you assign a LUT that can't apply in that mode (e.g. an SDR LUT to an HDR display). A LUT is applied only when its type matches the display's mode (see *HDR / SDR LUT selection*).
+- **SDR-in-HDR gamma fix**: Optional **On / Off** control, with a target-gamma dropdown (2.2 / 2.4 / 2.6, default 2.4), that patches DWM's SDR→scRGB conversion shaders so SDR content is mapped into the HDR space with a pure power curve instead of the piecewise sRGB curve Windows uses, which otherwise lifts near-blacks and washes SDR content out in HDR mode. Native HDR content is unaffected, and the fix is independent of the LUT (see *SDR-in-HDR gamma fix* below).
 
 #### Project Layout:
 - `DwmLutGUI/MainWindow.xaml`: Main user interface.
@@ -41,6 +43,8 @@ A WPF application used to configure and monitor the LUT application status.
 - `DwmLutGUI/Injector.cs`: Handles process discovery and DLL injection.
 - `DwmLutGUI/MainViewModel.cs`: Core application logic, monitor enumeration, and config persistence.
 - `DwmLutGUI/HdrInfo.cs`: Queries Windows for each display's HDR (advanced-color) state.
+- `DwmLutGUI/EotfPatcher.cs`: Applies the SDR-in-HDR gamma fix by patching DWM's shader bytecode in memory.
+- `DwmLutGUI/GuiDiag.cs`: Optional GUI-side diagnostic log (default off).
 
 ---
 
@@ -52,7 +56,7 @@ Windows 11 Build 26200 (25H2) significantly refactored DWM's internal structures
 Each overlay composition context reports **local, origin-`(0,0)` coordinates at native resolution** — not its global desktop position — so monitors cannot be told apart by the context's clip rectangle directly. 
 This build reads each monitor's true **desktop origin from `self + 0x7658`** (two floats: `left, top`). Verified behavior: the primary monitor reads `(0, 0)`; a monitor positioned at desktop `x = -1280` reads `left = -1280`. That origin is matched against the position-named `.cube` files, so each context applies its own LUT. A strict 1:1 `context ↔ origin` ownership guard prevents any residual cross-assignment. (The monitor's native resolution is also available at `self + 0x4A24` as an alternate identifier.)
 
-On **24H2 / 23H2 / 22H2 / 21H2 / Windows 10**, the origin is read from that version's own clip-box offset instead — `*(void**)self + 0x53E8` (24H2), `*(void**)self + 0x466C` (23H2 / 22H2 / Windows 11), `self + 0x462C` read **directly** (21H2 — no extra dereference, ledoge's original scheme), or `self - 0x120` read **directly** as an int RECT (Windows 10 — also ledoge's scheme, no extra dereference) — all through the same SEH-guarded read. The 24H2 offsets are ed1ii's, the 22H2/23H2 offsets are lauralex's, and the 21H2 and Windows 10 offsets (with their direct-read addressing) are ledoge's; all these legacy paths are supported but unverified on current hardware.
+On **24H2 / 23H2 / 22H2 / 21H2 / Windows 10**, the origin is read from that version's own clip-box offset instead — `*(void**)self + 0x53E8` (24H2), `*(void**)self + 0x466C` (23H2 / 22H2 / Windows 11), `self + 0x462C` read **directly** (21H2 — no extra dereference, ledoge's original scheme), or `self - 0x120` read **directly** as an int RECT (Windows 10 — also ledoge's scheme, no extra dereference) — all through the same SEH-guarded read. The 24H2 offsets are ed1ii's, the 22H2/23H2 offsets are lauralex's, and the 21H2 and Windows 10 offsets (with their direct-read addressing) are ledoge's; the 21H2 path is hardware-validated (22000.1880, including a three-display layout with negative coordinates); the remaining legacy paths are supported but unverified on current hardware.
 
 ### Backbuffer Acquisition
 DWM no longer exposes an `IDXGISwapChain` through standard patterns. The engine obtains each monitor's composed surface from the **`IOverlaySwapChain`** object by calling `vt[24]`, then `vt[19]` on the returned object, then `QueryInterface(ID3D11Texture2D)` to reach the backbuffer texture. If this cannot resolve a surface, that monitor's frame is skipped. (An earlier brute-force scan that probed arbitrary offsets for a swapchain pointer was removed — it could invoke unintended methods on non-swapchain pointers and destabilize composition.)
@@ -77,7 +81,7 @@ Before any draw, both the backbuffer and the LUT shader-resource-view are valida
 Multiple adapter devices are held **simultaneously** — a hybrid laptop composites on more than one GPU at once — so the engine never treats the appearance of a second device as a reason to evict the first. (Doing so previously caused a per-frame evict/rebuild thrash whenever an external monitor was attached, seen as reduced animation smoothness.)
 
 ### Version Profiles
-Each supported `dwmcore.dll` build is one **`DwmProfile`** row in `g_dwmProfiles[]`, and every row is self-contained: the dwmcore version, the four AOB signatures (embedded inline as fixed-size byte arrays, `'?'` = wildcard), and the build-specific offsets (clip-box + device-vector). At load, the engine reads the running `dwmcore.dll`'s file version and selects the newest row whose minimum version it satisfies (newest-first; a version-read failure falls back to the newest row; an unmatched build is skipped). Three builds are currently profiled — **26100.8246**, **26100.8655** and **26100.8875** — which share identical signatures but differ in their device-vector addresses. Supporting a future build is a single new row. (The 24H2 / 23H2 / legacy paths are not part of this table and are unchanged.)
+Each supported `dwmcore.dll` build is one **`DwmProfile`** row in `g_dwmProfiles[]`, and every row is self-contained: the dwmcore version, the four AOB signatures (embedded inline as fixed-size byte arrays, `'?'` = wildcard), and the build-specific offsets (clip-box + device-vector). At load, the engine reads the running `dwmcore.dll`'s file version and selects the newest row whose minimum version it satisfies (newest-first; a version-read failure falls back to the newest row; an unmatched build is skipped). Four builds are currently profiled — **26100.8246**, **26100.8655**, **26100.8875** and **26100.8935** — which all share identical signatures but differ in their device-vector addresses, and, from 8935 onwards, in the clip-box offset too. Supporting a future build is a single new row (the 24H2 / 23H2 / legacy paths are not part of this table and are unchanged).
 
 ### HDR / SDR LUT selection
 DWM composites an HDR display into an FP16 (scRGB) backbuffer and an SDR display into an 8/10-bit backbuffer, and the shader applies the LUT through an HDR (PQ/BT.2100) or SDR path accordingly — so a LUT is only valid for the mode it was calibrated in. The engine matches **exactly**: an HDR context takes the HDR LUT, an SDR context takes the SDR LUT. If the only LUT assigned to a display is the wrong type for its current mode, **no LUT is applied** rather than a mismatched one (which, run through the other path, would produce wrong colors). Use an HDR LUT (a `.cube` with `hdr` in the filename, calibrated in HDR) for a display in HDR mode, and an SDR LUT for SDR mode.
@@ -92,6 +96,19 @@ The handler runs every frame, so this release is gated rather than unconditional
 - A process-wide **kill-switch** makes every hook return immediately once tripped, so DWM composites normally instead of crash-looping (tripped by the render-path exception boundary and on DLL detach).
 - The render path runs behind a structured-exception boundary; any access violation is contained and latches the kill-switch rather than propagating into DWM.
 - Assets are validated per device before every bind, and any adapter/output whose resources fail to build is skipped rather than crashing.
+
+### SDR-in-HDR gamma fix
+Windows maps SDR content into the HDR (scRGB) composition space using the **piecewise sRGB** transfer function. Virtually all SDR content is authored on gamma-2.2 displays, so the mismatch lifts near-blacks and flattens shadows in HDR mode, and Windows exposes no control over it.
+
+sRGB is a **piecewise** transfer function: a short linear segment below `V = 0.04045` (there so the inverse curve doesn't need unbounded precision near black) and a power segment `((V + 0.055)/1.055)^2.4` above it. That toe is what makes its effective gamma flatter than 2.2 in the shadows, which is precisely where content graded on a pure-gamma display looks lifted.
+
+This is corrected by rewriting the four sRGB constants inside DWM's own SDR→scRGB conversion shaders, collapsing the two pieces into one: breakpoint `0.04045` → `0` (nothing is ever ≤ 0, so the linear toe can never be selected), offset `0.055` → `0` and `1/1.055` → `1` (the power segment becomes plain `V^n`), and exponent `2.4` → the selected gamma. The target is chosen in the GUI from **2.2 / 2.4 / 2.6**, defaulting to **2.4** (BT.1886, the dark-room viewing standard, and ledoge's own default; 2.2 is the nominal sRGB authoring target and 2.6 is DCI); note that at 2.4 the exponent constant is left unchanged, because sRGB's own exponent is already 2.4 — the correction there comes entirely from removing the toe. The shaders are identified by their **DXBC checksum** rather than by offset — the same four hashes match unchanged from 21H2 (22000) through the 26H2 preview (26100.8935) — and every copy is patched, since dwmcore ships duplicates of some of them (4 sites on 26100.8246, 6 on 22000.1880).
+
+**Why this cannot be done in the LUT shader.** The LUT runs in `COverlayContext::Present`, after composition, where SDR- and HDR-originated pixels are already blended into one surface; any transform there necessarily hits native HDR content too. These conversion shaders run before composition and only on SDR content, so patching them leaves HDR alone. The two are orthogonal — a **content-domain** correction and a **display-domain** correction — and compose cleanly.
+
+**Timing.** DWM creates its pixel shader objects from these blobs at startup; patching the bytecode afterwards has no effect on shaders that already exist. Enabling or disabling the fix therefore restarts DWM, and the patch is applied from the GUI with the fresh process **suspended**, before it can build its shaders. For the same reason, changing the target gamma while the fix is already on does nothing until it is switched off and on again.
+
+**Guards.** The checksum implementation is verified against unmodified blobs in the loaded image before anything is written; a mismatch aborts the patch. Shader and container checksums are both recomputed. Live state is read back out of DWM rather than remembered. Consecutive DWM restarts are rate-limited, because repeatedly rebuilding the display pipeline in quick succession can leave a multi-monitor configuration in a bad state.
 
 ---
 
@@ -111,34 +128,36 @@ The handler runs every frame, so this release is gated rather than unconditional
 
 ***26100.8655 delta:** same structure, shifted RVAs — `Present` `0x231800`, `OverlaysEnabled` `0x1A2BE8`, `IsCandidateDirectFlipCompatible` `0xB1414` (member `0x4BF8`), `ProcessDeviceLost` `0xDCF80`, and device vector `_Myfirst`/`_Mylast` `0x3FAB78`/`0x3FAB80`. Signature bytes, clip-box `0x7658`, stride `0x10`, and lost-flag `0x458` are unchanged.*
 ***26100.8875 delta:** signature bytes unchanged (all four match uniquely) — `Present` `0x231530`, `OverlaysEnabled` `0xA048`, `IsCandidateDirectFlipCompatible` `0x6E1F4`, `ProcessDeviceLost` `0xB3780`. Device vector `_Myfirst`/`_Mylast` moved to `0x3FCC98`/`0x3FCCA0`; clip-box `0x7658`, stride `0x10`, and lost-flag `0x458` unchanged.*
+***26100.8935 delta (26H2 preview, OS build 26300):** signature bytes unchanged (all four match uniquely) — `Present` `0x22F5B0`, `OverlaysEnabled` `0x1CDF08`, `IsCandidateDirectFlipCompatible` `0x15C094`, `ProcessDeviceLost` `0xB92D0`. Device vector `_Myfirst`/`_Mylast` moved to `0x3FAD38`/`0x3FAD40`, and the `DeviceClipBox` moved for the first time since 8246: **`self + 0x7648`**. `0x7658` still exists but now holds an int monitor-**local** box that always starts at `(0,0)`, so reading the old offset makes every context report the same origin and only the primary display receives a LUT. Stride `0x10` and lost-flag `0x458` unchanged. Verified on a live 3-monitor 26H2-preview VM. Preview build — these offsets may shift before 26H2 ships.*
 
 ## Verified dwmcore values
 
-| Field                          | 8246                          | 8655                          | 8875              | changed?   |
-| ------------------------------ | ----------------------------- | ----------------------------- | ----------------- | ---------- |
-| `minVersion`                   | `DWM_VER(26100, 8246)`        | `DWM_VER(26100, 8655)`        | `DWM_VER(26100, 8875)` | **yes** |
-| `Present` sig                  | @ RVA 0x232A20                | @ RVA 0x231800                | @ RVA 0x231530    | same bytes |
-| `OverlaysEnabled` sig          | @ RVA 0x18893C                | @ RVA 0x1A2BE8                | @ RVA 0xA048      | same bytes |
-| `IsCandidateDF` sig            | @ RVA 0x5E7D4 (member 0x4BF8) | @ RVA 0xB1414 (member 0x4BF8) | @ RVA 0x6E1F4     | same bytes |
-| `ProcessDeviceLost` sig        | @ RVA 0xEF370                 | @ RVA 0xDCF80                 | @ RVA 0xB3780     | same bytes |
-| `clipBoxOffset`                | `0x7658`                      | `0x7658`                      | `0x7658`          | same bytes |
-| `deviceVecFirstRva` (_Myfirst) | `0x3FDA88`                    | `0x3FAB78`                    | **`0x3FCC98`**    | **yes**    |
-| `deviceVecLastRva` (_Mylast)   | `0x3FDA90`                    | `0x3FAB80`                    | **`0x3FCCA0`**    | **yes**    |
-| `deviceInfoStride`             | `0x10`                        | `0x10`                        | `0x10`            | same       |
-| `deviceLostFlagOffset`         | `0x458`                       | `0x458`                       | `0x458`           | same       |
+| Field                          | 8246                          | 8655                          | 8875              | 8935 (26H2 preview) | changed?   |
+| ------------------------------ | ----------------------------- | ----------------------------- | ----------------- | ------------------- | ---------- |
+| `minVersion`                   | `DWM_VER(26100, 8246)`        | `DWM_VER(26100, 8655)`        | `DWM_VER(26100, 8875)` | `DWM_VER(26100, 8935)` | **yes** |
+| `Present` sig                  | @ RVA 0x232A20                | @ RVA 0x231800                | @ RVA 0x231530    | @ RVA 0x22F5B0      | same bytes |
+| `OverlaysEnabled` sig          | @ RVA 0x18893C                | @ RVA 0x1A2BE8                | @ RVA 0xA048      | @ RVA 0x1CDF08      | same bytes |
+| `IsCandidateDF` sig            | @ RVA 0x5E7D4 (member 0x4BF8) | @ RVA 0xB1414 (member 0x4BF8) | @ RVA 0x6E1F4     | @ RVA 0x15C094      | same bytes |
+| `ProcessDeviceLost` sig        | @ RVA 0xEF370                 | @ RVA 0xDCF80                 | @ RVA 0xB3780     | @ RVA 0xB92D0       | same bytes |
+| `clipBoxOffset`                | `0x7658`                      | `0x7658`                      | `0x7658`          | **`0x7648`**        | **yes**    |
+| `deviceVecFirstRva` (_Myfirst) | `0x3FDA88`                    | `0x3FAB78`                    | `0x3FCC98`        | **`0x3FAD38`**      | **yes**    |
+| `deviceVecLastRva` (_Mylast)   | `0x3FDA90`                    | `0x3FAB80`                    | `0x3FCCA0`        | **`0x3FAD40`**      | **yes**    |
+| `deviceInfoStride`             | `0x10`                        | `0x10`                        | `0x10`            | `0x10`              | same       |
+| `deviceLostFlagOffset`         | `0x458`                       | `0x458`                       | `0x458`           | `0x458`             | same       |
 
 ---
 
 ## Known Limitations
 
-- **Binary-version lock:** Signatures and offsets are valid for `dwmcore.dll` 10.0.26100.8246, 10.0.26100.8655 and 10.0.26100.8875 (Windows 11 25H2, builds 26200.8246, 26200.8655 and 26200.8875), ImageBase `0x180000000`, thus the tool is not guaranteed to work on older 25H2 builds for which LUT application is skipped entirely as a safety measure. 
-  Support for older Windows versions (20H2, 21H1, 21H2, 22H2, 23H2, 24H2) has been kept, but no evaluation has been conducted for such legacy ones.
+- **Binary-version lock:** Signatures and offsets are valid for `dwmcore.dll` 10.0.26100.8246, 10.0.26100.8655, 10.0.26100.8875 (Windows 11 25H2, builds 26200.8246 / 8655 / 8875) and 10.0.26100.8935 (Windows 11 26H2 preview, build 26300), ImageBase `0x180000000`, thus the tool is not guaranteed to work on older 25H2 builds for which LUT application is skipped entirely as a safety measure. The 8935 profile is derived from a **preview** build and may need revisiting when 26H2 ships. 
+  Support for older Windows versions (20H2, 21H1, 22H2, 23H2, 24H2) has been kept but not evaluated; 21H2 (22000) is hardware-validated.
 - **Static C++ runtime (build requirement):** the injector links the C++ runtime statically (`/MT`), so `lutdwm.dll` carries no dependency on the target's `msvcp140.dll` / VC++ redistributable. A dynamic-CRT (`/MD`) build made with the VS2022 17.10+ toolset crashes in `msvcp140!mtx_do_lock` — a null dereference inside `std::mutex::lock`, on the first mutex taken in the LUT path — on any machine whose VC++ runtime predates 14.40, because that toolset's `constexpr` `std::mutex` layout is incompatible with the older runtime. This is unrelated to the dwmcore version; static linking removes it outright.
+- **SDR-in-HDR gamma fix restarts DWM:** Because DWM builds its pixel shaders at startup, switching the fix on or off requires a fresh DWM — a brief black flash, and any per-session compositor state is rebuilt. Consecutive toggles are therefore rate-limited (the buttons are disabled with a short countdown between them): restarting the display pipeline several times in quick succession has been observed to leave a multi-monitor setup in a bad state, with a display dropping out and scaling/HDR reset until reconnected or rebooted. Set the fix once rather than toggling it repeatedly. The patch is memory-only — it never modifies `dwmcore.dll` on disk and is gone after any DWM restart or reboot — so a normal LUT Apply / Disable, which does *not* restart DWM, will not carry it over.
 - **Crash proof, update vulnerable:** When a Windows update breaks the tool, the symptom points to the cause:
   - *Nothing happens at all* → a `COverlayContext` **signature** moved (most likely `Present`), or the running dwmcore has **no matching profile**.
-  - *Wrong monitor / wrong colors* → the clip-box **offset** (`0x7658`) or `GetBackBuffer_25H2`'s `vt[24]`/`vt2[19]` indices moved.
+  - *Wrong monitor / wrong colors, or only the primary display gets its LUT* → the clip-box **offset** moved (per build: `0x7658` on 8246 / 8655 / 8875, `0x7648` on 8935), or `GetBackBuffer_25H2`'s `vt[24]`/`vt2[19]` indices moved. Note that dwmcore also carries a monitor-**local** clip box a few fields away that always reads `(0,0)`; picking that one by mistake makes every display collide on one origin, so only the primary is color-managed. The `DIAG_MONITOR_MATCH` build switch dumps every clip-box-shaped RECT per context and is the reliable way to tell them apart on a multi-monitor layout.
   - *Flicker / LUT dropping out on a surface* → `OverlayTestMode` / the overlay hooks moved.
-  - *DWM crashes again on a fullscreen mode change* → the `ProcessDeviceLost` signature or a device-vector offset moved (per build; `0x3FDA88`/`0x3FDA90` on 8246, `0x3FAB78`/`0x3FAB80` on 8655, `0x3FCC98`/`0x3FCCA0` on 8875; stride `0x10`, flag `0x458`).
+  - *DWM crashes again on a fullscreen mode change* → the `ProcessDeviceLost` signature or a device-vector offset moved (per build; `0x3FDA88`/`0x3FDA90` on 8246, `0x3FAB78`/`0x3FAB80` on 8655, `0x3FCC98`/`0x3FCCA0` on 8875, `0x3FAD38`/`0x3FAD40` on 8935; stride `0x10`, flag `0x458`).
   - *DWM crashes when a video/app goes fullscreen (overlay path)* → a hooked overlay function is being relied upon by DWM to preserve a volatile register across the call. On 25H2 `OverlaysEnabled` is left unhooked for this reason; if a similar crash appears with another overlay hook (`IsCandidateDirectFlipCompatible` family) in the stack, it needs the same treatment.
   Adding support for a new build is a **single prepended `g_dwmProfiles[]` entry**, but obtaining the values is a reverse-engineering pass (disassembly + live capture).
 - **Exclusive / mode-changed fullscreen is not *guaranteed* to be color-managed:** (e.g. old DirectDraw games switching to a native-resolution fullscreen): such surfaces bypass DWM composition, so the LUT is not reliably reachable (matches ledoge's original limitation). This **no longer crashes DWM** and **recovers its LUTs cleanly on exit**, even on a multi-GPU / multi-monitor setup. The LUT may remain applied through such a fullscreen DWM bypass, now that resources stay stable across the transition, but that is not guaranteed. A LUT is applied only while DWM **composites** a surface. When a fullscreen or borderless game presents a flip-model swapchain that DWM promotes to **IndependentFlip** (direct scanout), the frames bypass composition entirely, so no LUT can be applied. This is a DWM decision, made per frame from swapchain state, occlusion, the mouse cursor, and MPO capability, with **no hookable entry point on 25H2** — the relevant `CCompSwapChain` / `CWindowContext` flip-candidate checks are unreachable there. Exclusive-fullscreen apps bypass DWM outright and likewise cannot be reached. Windowed and *composited* fullscreen surfaces (most fullscreen browser video, and legacy fullscreen games that DWM still composites) do get the LUT.
@@ -146,4 +165,4 @@ The handler runs every frame, so this release is gated rather than unconditional
 
 ---
 
-*Last Updated: 26 July 2026*
+*Last Updated: 31 July 2026*

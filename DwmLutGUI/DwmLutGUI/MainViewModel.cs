@@ -17,7 +17,6 @@ namespace DwmLutGUI
         public event PropertyChangedEventHandler PropertyChanged;
 
         private string _activeText;
-        private MonitorData _selectedMonitor;
         private bool _isActive;
         private Key _toggleKey;
         private bool _autostartAsked;
@@ -48,8 +47,8 @@ namespace DwmLutGUI
 
         private void MonitorDataOnStaticPropertyChanged(object sender, PropertyChangedEventArgs e)
         {
-            OnPropertyChanged(nameof(SdrLutPath));
-            OnPropertyChanged(nameof(HdrLutPath));
+            // Each monitor column binds straight to its own MonitorData, so there is nothing to
+            // re-notify here - this exists purely to persist the change.
             if (!_updatingMonitors) SaveConfig();   // never persist a half-rebuilt list (see flag)
         }
 
@@ -62,19 +61,6 @@ namespace DwmLutGUI
                 OnPropertyChanged();
             }
             get => _activeText;
-        }
-
-        public MonitorData SelectedMonitor
-        {
-            set
-            {
-                if (value == _selectedMonitor) return;
-                _selectedMonitor = value;
-                OnPropertyChanged();
-                OnPropertyChanged(nameof(SdrLutPath));
-                OnPropertyChanged(nameof(HdrLutPath));
-            }
-            get => _selectedMonitor;
         }
 
         private void UpdateConfigChanged()
@@ -137,32 +123,6 @@ namespace DwmLutGUI
             }
         }
 
-        public string SdrLutPath
-        {
-            set
-            {
-                if (SelectedMonitor == null || SelectedMonitor.SdrLutPath == value) return;
-                SelectedMonitor.SdrLutPath = value;
-                OnPropertyChanged();
-
-                SaveConfig();
-            }
-            get => SelectedMonitor?.SdrLutPath;
-        }
-
-        public string HdrLutPath
-        {
-            set
-            {
-                if (SelectedMonitor == null || SelectedMonitor.HdrLutPath == value) return;
-                SelectedMonitor.HdrLutPath = value;
-                OnPropertyChanged();
-
-                SaveConfig();
-            }
-            get => SelectedMonitor?.HdrLutPath;
-        }
-
         public Key ToggleKey
         {
             set
@@ -200,6 +160,136 @@ namespace DwmLutGUI
 
         public bool CanApply { get; }
 
+        /// <summary>
+        /// SDR-in-HDR gamma fix: patches DWM's SDR-to-scRGB shaders to a pure 2.2 curve.
+        /// Independent of the LUT - this corrects how SDR content is mapped into the HDR space,
+        /// the LUT corrects the display. Native HDR content is unaffected.
+        /// </summary>
+        public bool GammaFixEnabled
+        {
+            get => Injector.GammaFixEnabled;
+            private set
+            {
+                if (Injector.GammaFixEnabled == value) return;
+                Injector.GammaFixEnabled = value;
+                OnPropertyChanged(nameof(GammaFixEnabled));
+            }
+        }
+
+        private bool _gammaFixActive;
+
+        // Set while we are deliberately restarting DWM, so the resulting display-settings events
+        // are ignored instead of triggering a spurious re-inject.
+        private bool _suppressDisplayEvents;
+
+        /// <summary>
+        /// Whether the patch is actually live in DWM right now. Read back out of DWM's memory
+        /// rather than remembered, so it stays correct across GUI restarts.
+        /// </summary>
+        public bool GammaFixActive
+        {
+            get => _gammaFixActive;
+            private set
+            {
+                if (_gammaFixActive == value) return;
+                _gammaFixActive = value;
+                OnPropertyChanged(nameof(GammaFixActive));
+                OnPropertyChanged(nameof(CanEnableGammaFix));
+                OnPropertyChanged(nameof(CanDisableGammaFix));
+            }
+        }
+
+        // True while a gamma operation is running, so a second click cannot start another one.
+        private bool _gammaOpInProgress;
+
+        /// <summary>
+        /// True while we are still inside the minimum interval between DWM restarts. The buttons
+        /// are disabled during this window rather than blocking the UI thread, so repeat clicks
+        /// cannot queue up into a burst of restarts.
+        /// </summary>
+        public bool GammaFixCoolingDown => Injector.RestartCooldownRemainingMs > 0;
+
+        /// <summary>Gamma values offered by the dropdown next to the On/Off buttons.</summary>
+        public double[] GammaFixValues { get; } = { 2.2, 2.4, 2.6 };
+
+        /// <summary>
+        /// Target gamma for the fix. Changing this while the fix is already live deliberately does
+        /// nothing to the running DWM: the patch is baked into shaders that already exist, so a new
+        /// value only takes effect on the next off/on cycle.
+        /// </summary>
+        public double SelectedGammaValue
+        {
+            get => Injector.GammaFixValue;
+            set
+            {
+                if (Injector.GammaFixValue == value) return;
+                Injector.GammaFixValue = value;
+                OnPropertyChanged(nameof(SelectedGammaValue));
+                GuiDiag.Log("gamma target set to " + value.ToString("0.0") +
+                            (GammaFixActive ? " (fix is live - off/on required for it to take effect)" : ""));
+            }
+        }
+
+        /// <summary>"On" is available only when the fix isn't already live and we are ready.</summary>
+        public bool CanEnableGammaFix =>
+            CanApply && !_gammaFixActive && !_gammaOpInProgress && !GammaFixCoolingDown;
+
+        /// <summary>"Off" mirrors it: only when the fix IS live and we are ready.</summary>
+        public bool CanDisableGammaFix =>
+            _gammaFixActive && !_gammaOpInProgress && !GammaFixCoolingDown;
+
+        /// <summary>Row label, with a note while the buttons are held back so the wait is explained.</summary>
+        public string GammaFixLabel
+        {
+            get
+            {
+                const string baseText = "scRGB piecewise -> scRGB 2.x (HDR gamma fix):";
+                var left = Injector.RestartCooldownRemainingMs;
+                return left > 0
+                    ? baseText + "  (settling " + ((left + 999) / 1000) + "s)"
+                    : baseText;
+            }
+        }
+
+        // Last values actually published to the bindings. These are compared against the CURRENT
+        // values on every tick, so the gating is level-triggered and self-correcting.
+        //
+        // It used to be edge-triggered on a "was cooling down" flag, which could desync: a long
+        // operation blocks the UI thread, DispatcherTimer coalesces the missed ticks, and the single
+        // tick that follows can land after the cooldown has already expired. The transition was then
+        // never observed, no PropertyChanged was raised, and the buttons stayed disabled forever
+        // with the label frozen mid-countdown. Comparing real values cannot get stuck that way: even
+        // if a tick is missed entirely, the next one still sees the mismatch and republishes.
+        private string _lastGammaLabel;
+        private bool? _lastCanEnableGamma;
+        private bool? _lastCanDisableGamma;
+
+        /// <summary>Called from the status timer so the buttons re-enable when the cooldown ends.</summary>
+        private void RefreshGammaGating()
+        {
+            var label = GammaFixLabel;
+            if (label != _lastGammaLabel)
+            {
+                _lastGammaLabel = label;
+                OnPropertyChanged(nameof(GammaFixLabel));
+            }
+
+            var canEnable = CanEnableGammaFix;
+            if (_lastCanEnableGamma != canEnable)
+            {
+                _lastCanEnableGamma = canEnable;
+                OnPropertyChanged(nameof(CanEnableGammaFix));
+                OnPropertyChanged(nameof(GammaFixCoolingDown));
+            }
+
+            var canDisable = CanDisableGammaFix;
+            if (_lastCanDisableGamma != canDisable)
+            {
+                _lastCanDisableGamma = canDisable;
+                OnPropertyChanged(nameof(CanDisableGammaFix));
+            }
+        }
+
         private List<MonitorData> _allMonitors { get; }
         // True only while UpdateMonitors is rebuilding the monitor list. During the rebuild,
         // MonitorData constructors set SdrLutPath/HdrLutPath through their setters, which raise
@@ -217,7 +307,34 @@ namespace DwmLutGUI
 
         private void UpdateMonitorsCore()
         {
-            var selectedPath = SelectedMonitor?.DevicePath;
+            // Query the display topology BEFORE clearing anything. QueryDisplayConfig legitimately
+            // fails with ERROR_NOT_SUPPORTED while the topology is in flux - which is exactly the
+            // state a DWM restart, a monitor hot-plug or a mode change puts it in - so retry
+            // briefly, and if it still fails leave the existing monitor list untouched rather than
+            // wiping it. (Clearing first and throwing here left the GUI with no monitors at all.)
+            IEnumerable<WindowsDisplayAPI.DisplayConfig.PathInfo> paths = null;
+            for (var attempt = 0; attempt < 10; attempt++)
+            {
+                try
+                {
+                    paths = WindowsDisplayAPI.DisplayConfig.PathInfo.GetActivePaths();
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    if (attempt == 0) GuiDiag.Log("[monitors] GetActivePaths failed (" + ex.GetType().Name +
+                                                  ": " + ex.Message + ") - retrying");
+                    System.Threading.Thread.Sleep(150);
+                }
+            }
+
+            if (paths == null)
+            {
+                // Topology never settled. Keep the previous state and try again on the next event.
+                GuiDiag.Log("[monitors] GetActivePaths never succeeded - keeping previous monitor list");
+                return;
+            }
+
             _allMonitors.Clear();
             Monitors.Clear();
             List<XElement> config = null;
@@ -246,7 +363,6 @@ namespace DwmLutGUI
             // hybrid multi-GPU laptops, producing "1, 1, 2").
             var displayIndex = 0;
 
-            var paths = WindowsDisplayAPI.DisplayConfig.PathInfo.GetActivePaths();
             var hdrStates = HdrInfo.GetHdrStates();   // device path -> currently in HDR mode
             foreach (var path in paths)
             {
@@ -340,13 +456,6 @@ namespace DwmLutGUI
                 }
             }
 
-            if (selectedPath == null) return;
-
-            var previous = Monitors.FirstOrDefault(monitor => monitor.DevicePath == selectedPath);
-            if (previous != null)
-            {
-                SelectedMonitor = previous;
-            }
         }
 
         public void ReInject()
@@ -367,11 +476,144 @@ namespace DwmLutGUI
         public void Uninject()
         {
             Injector.Uninject();
+            UpdateActiveStatus(true);
+        }
+
+        /// <summary>Turn the gamma fix on. Leaves the LUT exactly as it was.</summary>
+        public void EnableGammaFix()
+        {
+            if (_gammaOpInProgress || GammaFixCoolingDown)
+            {
+                GuiDiag.Log("gamma ON ignored (operation in progress or cooling down)");
+                return;
+            }
+
+            var lutWasActive = IsActive;
+            GammaFixEnabled = true;
+            ApplyGammaFixChange(lutWasActive);
+        }
+
+        /// <summary>Turn the gamma fix off. Leaves the LUT exactly as it was.</summary>
+        public void DisableGammaFix()
+        {
+            if (_gammaOpInProgress || GammaFixCoolingDown)
+            {
+                GuiDiag.Log("gamma OFF ignored (operation in progress or cooling down)");
+                return;
+            }
+
+            var lutWasActive = IsActive;
+            GammaFixEnabled = false;
+            ApplyGammaFixChange(lutWasActive);
+        }
+
+        private void ApplyGammaFixChange(bool keepLutActive)
+        {
+            var monitorsBefore = Monitors.Count;
+            GuiDiag.Log("=== gamma fix -> " + (Injector.GammaFixEnabled ? "ON" : "OFF") +
+                        " (keepLutActive=" + keepLutActive + ", monitors=" + monitorsBefore + ") ===");
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            _gammaOpInProgress = true;
+            OnPropertyChanged(nameof(CanEnableGammaFix));
+            OnPropertyChanged(nameof(CanDisableGammaFix));
+
+            _suppressDisplayEvents = true;
+            try
+            {
+                ApplyGammaFixChangeCore(keepLutActive);
+            }
+            catch (Exception ex)
+            {
+                GuiDiag.LogError("ApplyGammaFixChange", ex);
+                throw;
+            }
+            finally
+            {
+                _suppressDisplayEvents = false;
+                _gammaOpInProgress = false;
+                // Invalidate the published values so the next tick definitely republishes.
+                _lastGammaLabel = null;
+                _lastCanEnableGamma = null;
+                _lastCanDisableGamma = null;
+                OnPropertyChanged(nameof(CanEnableGammaFix));
+                OnPropertyChanged(nameof(CanDisableGammaFix));
+                OnPropertyChanged(nameof(GammaFixLabel));
+                GuiDiag.Log("=== gamma fix sequence done in " + sw.ElapsedMilliseconds + "ms ===");
+            }
+
+            // Re-read the topology once things have settled, so the monitor list reflects reality
+            // after the restart even though the events during it were ignored.
+            UpdateMonitors();
+            UpdateActiveStatus(true);
+            GuiDiag.Log("post-settle: monitors=" + Monitors.Count + " lutActive=" + IsActive +
+                        " gammaActive=" + GammaFixActive);
+
+            if (Monitors.Count < monitorsBefore)
+            {
+                // The display pipeline did not come back intact. Restarting DWM again now would
+                // very likely make it worse, so this is surfaced rather than silently retried.
+                GuiDiag.Log("*** DISPLAY LOST: monitor count fell from " + monitorsBefore + " to " +
+                            Monitors.Count + " across the DWM restart. Avoid further gamma toggles " +
+                            "until the display configuration has recovered (reconnect the display or reboot).");
+            }
+        }
+
+        private void ApplyGammaFixChangeCore(bool keepLutActive)
+        {
+            Injector.Uninject();
+            GuiDiag.Log("  uninjected");
+
+            // Stage first: none of the file/ACL work depends on DWM, and doing it after the
+            // restart would put it inside the window where DWM is creating its shaders. Staging
+            // first also means a staging failure leaves DWM untouched instead of already killed.
+            if (keepLutActive)
+            {
+                Injector.StageForInject(Monitors);
+                GuiDiag.Log("  staged LUTs for re-inject");
+            }
+
+            // The patch has to land before DWM builds its pixel shaders, so a state change needs
+            // a fresh DWM either way: to switch the fix on, and equally to switch it off (the
+            // already-created patched shaders can only be discarded by rebuilding them).
+            Injector.RestartDwmAndWait();
+
+            if (Injector.GammaFixEnabled)
+            {
+                // Patched from here, with DWM suspended - no race against shader creation.
+                var sites = Injector.ApplyEotfPatch(Injector.GammaFixValue);
+                if (sites == 0)
+                {
+                    GuiDiag.Log("  WARNING: patch reported 0 sites - the fix is probably NOT active");
+                }
+            }
+
+            if (keepLutActive)
+            {
+                Injector.InjectStaged();
+                GuiDiag.Log("  re-injected LUT DLL");
+                _activeConfig = _lastConfig;
+                UpdateConfigChanged();
+            }
+
+            // Re-reads the real state out of DWM, so a patch that silently failed shows up as
+            // the fix being off rather than the button lying.
             UpdateActiveStatus();
         }
 
-        private void UpdateActiveStatus()
+        private void UpdateActiveStatus(bool forceGammaCheck = false)
         {
+            // Ground truth from DWM's memory, same idea as GetStatus() for the LUT DLL. The check
+            // reads DWM's mapped dwmcore image, so the 1s status timer takes a cached answer and
+            // only real state changes force a fresh read.
+            var gamma = Injector.GetGammaFixStatus(forceGammaCheck);
+            if (gamma != null)
+            {
+                GammaFixActive = (bool)gamma;
+                Injector.GammaFixEnabled = (bool)gamma;   // keep the intent in sync with reality
+                OnPropertyChanged(nameof(GammaFixEnabled));
+            }
+
             var status = Injector.GetStatus();
             if (status != null)
             {
@@ -394,6 +636,11 @@ namespace DwmLutGUI
 
         public void OnDisplaySettingsChanged(object sender, EventArgs e)
         {
+            // Killing DWM makes Windows fire display-settings changes. Those are our own doing, and
+            // acting on them mid-operation would re-enter injection while the topology is still
+            // settling, so they are ignored until the operation completes.
+            if (_suppressDisplayEvents) return;
+
             var oldState = string.Join(";", Monitors.Select(m => m.Position + "|" + m.SdrLutPath + "|" + m.HdrLutPath));
 
             UpdateMonitors();
@@ -413,7 +660,26 @@ namespace DwmLutGUI
 
         private void DispatcherTimer_Tick(object sender, EventArgs e)
         {
-            UpdateActiveStatus();
+            // The status probe touches other processes and can throw transiently. It must never
+            // prevent the gating refresh, because that is what re-enables the gamma buttons after
+            // the cooldown - a swallowed failure there would leave them disabled indefinitely.
+            try
+            {
+                UpdateActiveStatus();
+            }
+            catch (Exception ex)
+            {
+                GuiDiag.LogError("DispatcherTimer_Tick/UpdateActiveStatus", ex);
+            }
+
+            try
+            {
+                RefreshGammaGating();
+            }
+            catch (Exception ex)
+            {
+                GuiDiag.LogError("DispatcherTimer_Tick/RefreshGammaGating", ex);
+            }
         }
 
         private void OnPropertyChanged([CallerMemberName] string name = null)

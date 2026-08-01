@@ -100,6 +100,8 @@
       <DependentUpon>App.xaml</DependentUpon>
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="EotfPatcher.cs" />
+    <Compile Include="GuiDiag.cs" />
     <Compile Include="HdrInfo.cs" />
     <Compile Include="Injector.cs" />
     <Compile Include="KeyboardUtils.cs" />

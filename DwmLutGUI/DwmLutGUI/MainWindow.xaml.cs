@@ -406,6 +406,32 @@ namespace DwmLutGUI
             });
         }
 
+        private void GammaFixOn_Click(object sender, RoutedEventArgs e)
+        {
+            Cursor = System.Windows.Input.Cursors.Wait;
+            try
+            {
+                _viewModel.EnableGammaFix();
+            }
+            finally
+            {
+                Cursor = null;
+            }
+        }
+
+        private void GammaFixOff_Click(object sender, RoutedEventArgs e)
+        {
+            Cursor = System.Windows.Input.Cursors.Wait;
+            try
+            {
+                _viewModel.DisableGammaFix();
+            }
+            finally
+            {
+                Cursor = null;
+            }
+        }
+
         private void AboutButton_Click(object sender, RoutedEventArgs o)
         {
             var window = new AboutWindow
@@ -415,39 +441,43 @@ namespace DwmLutGUI
             window.ShowDialog();
         }
 
+        // Browse now acts on the monitor whose column the button lives in (DataContext), the same way
+        // Next/Remove already did, so there is no "selected monitor" to keep track of.
         private void SdrLutBrowse_Click(object sender, RoutedEventArgs e)
         {
-            var folder = Path.GetDirectoryName(_viewModel.SdrLutPath);
-            var lutPath = BrowseLuts(folder);
-            if (!string.IsNullOrEmpty(lutPath))
-            {
-                _viewModel.SdrLutPath = lutPath;
-                WarnIfLutModeMismatch(false);
-            }
-        }
+            var monitor = (sender as FrameworkElement)?.DataContext as MonitorData;
+            if (monitor == null) return;
 
-        private void SdrLutClear_Click(object sender, RoutedEventArgs e)
-        {
-            _viewModel.SdrLutPath = "None";
+            var folder = Path.GetDirectoryName(monitor.SdrLutPath);
+            var lutPath = BrowseLuts(folder);
+            if (string.IsNullOrEmpty(lutPath)) return;
+
+            if (!monitor.SdrLuts.Contains(lutPath)) monitor.SdrLuts.Add(lutPath);
+            monitor.SdrLutPath = lutPath;
+            WarnIfLutModeMismatch(monitor, false);
+            ReapplyIfActive();
         }
 
         private void HdrLutBrowse_Click(object sender, RoutedEventArgs e)
         {
-            var folder = Path.GetDirectoryName(_viewModel.HdrLutPath);
+            var monitor = (sender as FrameworkElement)?.DataContext as MonitorData;
+            if (monitor == null) return;
+
+            var folder = Path.GetDirectoryName(monitor.HdrLutPath);
             var lutPath = BrowseLuts(folder);
-            if (!string.IsNullOrEmpty(lutPath))
-            {
-                _viewModel.HdrLutPath = lutPath;
-                WarnIfLutModeMismatch(true);
-            }
+            if (string.IsNullOrEmpty(lutPath)) return;
+
+            if (!monitor.HdrLuts.Contains(lutPath)) monitor.HdrLuts.Add(lutPath);
+            monitor.HdrLutPath = lutPath;
+            WarnIfLutModeMismatch(monitor, true);
+            ReapplyIfActive();
         }
 
         // Warn if the just-assigned LUT can't apply in the display's current mode. The DLL only applies a
         // LUT whose type matches the composition (HDR LUT for an HDR display, SDR LUT for an SDR display);
         // a mismatched LUT is silently ignored, so surface that here instead of leaving the user puzzled.
-        private void WarnIfLutModeMismatch(bool isHdrLut)
+        private void WarnIfLutModeMismatch(MonitorData m, bool isHdrLut)
         {
-            var m = _viewModel.SelectedMonitor;
             if (m == null) return;
             if (isHdrLut && !m.IsHdr)
                 MessageBox.Show(
@@ -457,11 +487,6 @@ namespace DwmLutGUI
                 MessageBox.Show(
                     "This display is currently in HDR mode.\n\nAn SDR LUT is only applied while the display is in SDR mode, so it will have no effect right now. Assign an HDR LUT for HDR mode, or disable HDR for this display in Windows display settings.",
                     "LUT / display-mode mismatch", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        }
-
-        private void HdrLutClear_Click(object sender, RoutedEventArgs e)
-        {
-            _viewModel.HdrLutPath = "None";
         }
 
         private void Disable_Click(object sender, RoutedEventArgs e)

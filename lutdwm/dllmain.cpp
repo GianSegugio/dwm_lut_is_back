@@ -30,6 +30,7 @@
 // Temporary diagnostic: 1 = log loaded LUTs and per-context origin resolution to
 // C:\Windows\Temp\dwm_diag.log (via diag_log, below). Set back to 0 for production builds.
 #define DIAG_MONITOR_MATCH 0
+
 #ifdef _DEBUG
 #define DEBUG_MODE true
 #else
@@ -420,6 +421,33 @@ struct DwmProfile
 // NOTE: signatures are embedded by value, so builds that share the same patterns repeat those bytes.
 static const DwmProfile g_dwmProfiles[] = {
 	// --- add newer dwmcore builds ABOVE (most-recent first) ---
+
+	// Windows 11 26H2 preview (OS build 26300) - dwmcore 10.0.26100.8935
+	// Signatures identical to 8875/8655/8246 (all four still match uniquely), but the context layout shifted:
+	// the per-monitor DESKTOP clip box moved 0x7658 -> 0x7648, and 0x7658 now holds an INT monitor-LOCAL box
+	// that always starts at (0,0) -- reading the old offset made every context report origin (0,0), so on a
+	// multi-monitor setup only the primary matched and the rest were rejected by ClaimPosition. The device-vector
+	// globals also moved. Verified on a live 3-monitor 26H2-preview VM (origins -1200,-22 / 0,0 / 3840,-22 all read
+	// correctly at 0x7648). PREVIEW BUILD: these offsets may shift again before 26H2 ships.
+	{
+		DWM_VER(26100, 8935),
+		{   // AOB signatures (inline)
+			// COverlayContext::Present
+			{ 0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x6C,
+			  0x24, 0xF9, 0x48, 0x81, 0xEC, 0xF8, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x05,
+			  '?', '?', '?', '?', 0x48, 0x33, 0xC4, 0x48, 0x89, 0x45, 0xEF, 0x4C, 0x8B, 0x65, '?', 0x48, 0x8B, 0xD9 }, 46,
+			// COverlayContext::OverlaysEnabled
+			{ 0x83, 0x3D, '?', '?', '?', '?', 0x05, 0x74, 0x09, 0x83, 0x79, 0x28, 0x01, 0x0F, 0x97, 0xC0, 0xC3 }, 17,
+			// COverlayContext::IsCandidateDirectFlipCompatible
+			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x68, 0x10, 0x48, 0x89, 0x70, 0x18, 0x48,
+			  0x89, 0x78, 0x20, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x20, 0x33, 0xDB }, 27,
+			// CDeviceManager::ProcessDeviceLost (prologue ends in a build-specific lea rcx,[rip+rel32], wildcarded)
+			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x48, 0x08, 0x56,
+			  0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x40, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0x0D, '?', '?', '?', '?' }, 33,
+		},
+		0x7648, 0x3FAD38, 0x3FAD40, 0x10, 0x458,  // clipBox, vecFirst, vecLast, stride, flag
+		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
+	},
 
 	// Windows 11 25H2 - dwmcore 10.0.26100.8875   (signatures identical to 8655/8246; clip box UNCHANGED at 0x7658, verified on a 2-monitor layout; only the device-vector globals moved)
 	{
@@ -2252,6 +2280,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				break;
 			}
+
 			return FALSE;
 		}
 	case DLL_PROCESS_DETACH:

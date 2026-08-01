@@ -34,6 +34,7 @@ namespace DwmLutGUI
 
         private void App_DispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
         {
+            GuiDiag.LogError("DispatcherUnhandledException", e.Exception);
             System.Windows.Forms.MessageBox.Show(
                 "Unhandled exception:\n\n" + e.Exception.ToString(),
                 "DwmLutGUI Error",
@@ -44,6 +45,7 @@ namespace DwmLutGUI
 
         private void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
         {
+            GuiDiag.LogError("CurrentDomain_UnhandledException", e.ExceptionObject as System.Exception);
             System.Windows.Forms.MessageBox.Show(
                 "Fatal exception:\n\n" + e.ExceptionObject.ToString(),
                 "DwmLutGUI Fatal Error",

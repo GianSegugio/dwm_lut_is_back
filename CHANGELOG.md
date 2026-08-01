@@ -3,11 +3,53 @@
 ## Note on environment tuning
 
 Since the switch to the Windows 11 Germanium Platform, DWM internals got updated and [lauralex/dwm_lut](https://github.com/lauralex/dwm_lut) was not working anymore. As for [ed1ii/dwm_lut_fixed](https://github.com/ed1ii/dwm_lut_fixed) it was developed to bring support up to 25H2 (Canary), but newer 25H2 builds broke DwmLut again.  
-This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246**, **10.0.26100.8655** and **10.0.26100.8875** (Windows 11 25H2, build 26200.8246, 26200.8655 and 26200.8875), ImageBase `0x180000000`. All signatures/offsets are valid for those 25H2 binaries, thus the tool is not guaranteed to work on older 25H2 builds for which LUT application is skipped entirely as a safety measure. Support for older Windows versions has been kept, but no evaluation has been conducted for such legacy ones.
+This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246**, **10.0.26100.8655**, **10.0.26100.8875** (Windows 11 25H2, builds 26200.8246 / 8655 / 8875) and **10.0.26100.8935** (Windows 11 26H2 preview, OS build 26300), ImageBase `0x180000000`. All signatures/offsets are valid for those binaries, thus the tool is not guaranteed to work on older 25H2 builds for which LUT application is skipped entirely as a safety measure. Windows 11 21H2 (22000) is now hardware-validated as well; the remaining legacy versions have been kept but not evaluated.
 
 ---
 ---
 
+## v1.2.0
+
+### New feature — SDR-in-HDR gamma fix (`DwmLutGUI/EotfPatcher.cs`)
+
+Windows composites SDR content into the HDR (scRGB) space using the **piecewise sRGB** transfer function. Practically all SDR content is authored on gamma-2.2 displays, so in HDR mode near-blacks are lifted and SDR content looks washed out, with no Windows setting to change it. v1.2.0 adds an optional fix, exposed as a target-gamma dropdown plus **On / Off** buttons next to the LUT Apply / Disable buttons.
+
+- **What it does.** Rewrites the sRGB constants inside DWM's own SDR→scRGB conversion shaders so the piecewise curve collapses to a pure power law: breakpoint `0.04045` → `0`, offset `0.055` → `0`, `1/1.055` → `1`, exponent `2.4` → the selected gamma. Removing the breakpoint means the linear toe near black can never be taken, which is where sRGB and a pure gamma curve actually differ; the offset and scale collapse `((V + 0.055)/1.055)^2.4` to plain `V^gamma`. The shaders are located by their **DXBC checksum**, not by offset, and every copy is patched (dwmcore ships duplicates of some of them, so the site count is build-dependent: 4 on 26100.8246, 6 on 22000.1880).
+- **Selectable target gamma.** A dropdown left of the On/Off buttons offers **2.2** (PC/sRGB nominal), **2.4** (BT.1886, dark room — also ledoge's own default) and **2.6** (DCI), defaulting to **2.4**. Changing it while the fix is live deliberately does nothing to the running DWM: the value is baked into pixel shaders that already exist, so it only takes effect on the next Off → On cycle.
+- **Why it is not part of the LUT.** The LUT runs in `COverlayContext::Present`, i.e. *after* composition, where SDR- and HDR-originated pixels are already blended and indistinguishable — any correction there would hit native HDR content too. These shaders run *before* composition and only on SDR content. The two corrections are orthogonal and compose cleanly: this is a **content-domain** fix, the LUT is a **display-domain** fix, so correctly-mapped SDR and calibrated native HDR can be had at the same time.
+- **Why DWM is restarted.** DWM builds its pixel shader objects from these blobs during startup; once those objects exist, patching the bytecode has no effect. Switching the fix on — and equally switching it off — therefore requires a fresh DWM (a brief black flash). Patching is done **from the GUI, with the target process suspended**, immediately after the restart and before the shaders are created, which removes any race. Writes go to DWM's private copy of the mapped image: `dwmcore.dll` on disk is never modified, and the patch disappears on any DWM restart or reboot.
+- **Safety.** Before patching anything, the checksum implementation is verified against several unmodified DXBC blobs in the loaded image; if it does not reproduce their stored checksums exactly, nothing is patched. Both the shader blobs and the container blobs they are nested in have their checksums recomputed after the edit.
+- **State is read back, not remembered.** Whether the fix is live is determined by comparing DWM's mapped `dwmcore.dll` against the copy on disk, so the button state stays correct across GUI restarts and reflects a DWM patched by any means.
+- **Restart pacing.** Restarting DWM tears down and rebuilds the whole display pipeline; doing it repeatedly in quick succession was observed to leave a multi-monitor setup in a bad state (a display dropping out, scaling and HDR reset). Consecutive restarts are therefore spaced by a minimum interval, during which the On/Off buttons are disabled and the row label shows a short countdown, so repeat clicks cannot queue into a burst.
+- **Independent of the LUT.** Turning the fix on or off leaves the LUT exactly as it was — applied or not — and a normal LUT Apply / Disable never restarts DWM.
+- **Third-party code.** The DXBC checksum routine is a C# port of AMD's `CalculateDXBCChecksum` (GPUOpen `common-src-ShaderUtils`, MIT), itself derived from the RSA Data Security, Inc. MD5 Message Digest Algorithm. Both notices were added to `LICENSE-THIRD-PARTY`.
+- **Validated** on Windows 11 25H2 (26100.8246) and 21H2 (22000.1880), single and dual monitor, with the LUT both active and inactive.
+
+### C++ injector — `lutdwm/dllmain.cpp`
+
+#### Windows 11 26H2 preview — `dwmcore.dll` 10.0.26100.8935 support
+- **New profile row.** 8935 is newer than the last profiled build, so without a matching row `SelectDwmProfile` would fall back to the 8875 offsets. A dedicated `DwmProfile` row for `DWM_VER(26100, 8935)` now sits at the top of `g_dwmProfiles[]`.
+- **RE delta (8935 vs 8875).** All four AOB signatures are byte-for-byte identical and still match uniquely — `Present` `0x22F5B0`, `OverlaysEnabled` `0x1CDF08`, `IsCandidateDirectFlipCompatible` `0x15C094`, `ProcessDeviceLost` `0xB92D0`. Two things moved: the device-vector globals `_Myfirst`/`_Mylast` → `0x3FAD38`/`0x3FAD40`, and — for the first time since 8246 — the per-monitor **`DeviceClipBox` moved to `self + 0x7648`**. `0x7658` still exists on 8935 but now holds an *int* monitor-**local** box that always begins at `(0,0)`; read as a float it yields `(0,0)` for every context, which on a multi-monitor setup makes every display collide on one origin so only the primary receives its LUT. Stride `0x10` and lost-flag `0x458` are unchanged.
+- **Verification.** Confirmed on a live 3-monitor 26H2-preview VM: at `self + 0x7648` the displays read `(0,0)`, `(-1200,-22)` and `(3840,-22)` and each matched its own LUT. **This is a preview build**; its layout may shift again before 26H2 ships.
+
+#### Windows 11 21H2 tier — now hardware-validated
+- The 21H2 tier (builds 22000–22620) was added in v1.1.1 from ledoge's values and had never been exercised on real hardware. It is now validated on 10.0.22000.1880 across single-monitor, USB-C and HDMI hot-plug, and a three-display layout with an HDR primary at `(0,0)` plus SDR displays at `(-300,-2160)` and `(-1500,-2176)` — confirming the direct-read float clip box at `self + 0x462C`, including negative coordinates.
+
+### GUI — `DwmLutGUI`
+
+#### New monitor table
+- **Was:** a `DataGrid` with one row per monitor and ten columns, plus a separate panel at the top that browsed and cleared the LUT of whichever row was *selected*.
+- **Is:** the table is transposed — properties are rows with full-width labels on the left, each monitor is a column. Since a machine has few monitors and many properties, this reads far better and the labels are no longer truncated. Each column is **self-contained**: name, index, connector, position, mode, status, and its own SDR and HDR pickers with **Browse / Next / Clear** buttons. The notion of a "selected monitor" and the entire top panel are gone, which removes the "which monitor am I editing?" ambiguity; the Apply/Disable hotkey selector moved to the bottom bar. Alternating rows are tinted slightly for readability, and columns scroll horizontally if more monitors are connected than fit.
+- **Browse also registers the file.** Picking a LUT now adds it to that monitor's list (so **Next** can cycle to it) and takes effect immediately when a LUT is already applied.
+
+#### Display-topology robustness
+- `QueryDisplayConfig` legitimately fails with `ERROR_NOT_SUPPORTED` while the display topology is in flux — exactly the state a DWM restart, a monitor hot-plug or a mode change produces. The monitor refresh now queries the topology **before** clearing anything and retries briefly, so a transient failure no longer surfaces as an unhandled exception, and never leaves the GUI with an empty monitor list. Display-change events caused by our own DWM restart are ignored while the operation is in progress, so they cannot trigger a re-inject mid-restart. Restarting DWM is also scoped to the current session, so other logged-in users' desktops are untouched.
+
+#### Diagnostics — `DwmLutGUI/GuiDiag.cs`
+- Added a GUI-side diagnostic log (default **off**, `GuiDiag.Enabled`) writing to `C:\Windows\Temp\dwmlut_gui.log`, next to the injector's `dwm_diag.log`. When enabled it records the full gamma-fix sequence — DWM restart timing, suspend/resume status, every shader site patched, region writes, and the live-vs-disk status comparison — plus any unhandled exception.
+
+---
+---
 ## v1.1.2
 
 ### C++ injector — `lutdwm/dllmain.cpp`
@@ -239,4 +281,4 @@ This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246**, **10.0.26
 
 ---
 
-*Last Updated: 26 July 2026*
+*Last Updated: 31 July 2026*
