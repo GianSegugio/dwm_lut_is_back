@@ -64,6 +64,19 @@ See [changelog](CHANGELOG.md) for new features and differences from ed1ii's [dwm
 ## Documentation
 See [documentation](DOCUMENTATION.md) for technical info and known limitations.
 
+## License
+
+This project is licensed under the **GNU General Public License v3.0** — see [LICENSE](LICENSE) for the full text. The licence is inherited from [ledoge/dwm_lut](https://github.com/ledoge/dwm_lut), which this fork descends from.
+
+Third-party components keep their own terms, reproduced in full in [LICENSE-THIRD-PARTY](LICENSE-THIRD-PARTY):
+
+| Component | Used for | License |
+| --- | --- | --- |
+| [MinHook](https://github.com/TsudaKageyu/minhook) | Hooking the DWM functions the injector intercepts | BSD 2-Clause |
+| Hacker Disassembler Engine 32 / 64 C | Instruction-length decoding, required by MinHook | BSD 2-Clause |
+| [WindowsDisplayAPI](https://github.com/falahati/WindowsDisplayAPI) | Monitor and display-config enumeration in the GUI | LGPL-3.0 |
+| [DXBCChecksum](https://github.com/GPUOpen-Archive/common-src-ShaderUtils/tree/master/DX10) | Recomputing DXBC shader checksums for the SDR-in-HDR gamma fix | MIT (AMD), incl. the RSA MD5 notice |
+
 ## Credits
 - **Original Author**: [ledoge](https://github.com/ledoge)
 - **Maintenance**: [lauralex](https://github.com/lauralex) and [ed1ii](https://github.com/ed1ii)
