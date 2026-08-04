@@ -53,8 +53,28 @@ namespace DwmLutGUI
         public string Name { get; }
         public string Connector { get; }
         public string Position { get; }
-        public bool IsHdr { get; set; }                    // display currently in HDR (advanced color) mode
-        public string HdrStatus => IsHdr ? "HDR" : "SDR";  // shown in the monitor list "Mode" column
+        // True when the display is in ANY advanced-colour mode (HDR or WCG). This deliberately
+        // matches what the injector sees: advanced colour composites in FP16, and the injector
+        // picks the HDR LUT slot from the FP16 back-buffer format, so WCG behaves like HDR as far
+        // as LUT selection goes.
+        public bool IsHdr { get; set; }
+
+        // The precise mode, used only for display - a WCG display is NOT an HDR display, and
+        // labelling it "HDR" is misleading (Auto Color Management puts plain SDR monitors here).
+        public AdvancedColorMode ColorMode { get; set; }
+
+        public string HdrStatus                            // shown in the monitor list "Mode" row
+        {
+            get
+            {
+                switch (ColorMode)
+                {
+                    case AdvancedColorMode.Hdr: return "HDR";
+                    case AdvancedColorMode.Wcg: return "WCG (advanced color)";
+                    default: return "SDR";
+                }
+            }
+        }
 
         // Live per-monitor state for the "Status" column, pushed by the composition-blocker watcher:
         // "Inactive" / "Active, windowed mode" / "Active, fullscreen mode".

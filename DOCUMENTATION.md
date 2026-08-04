@@ -31,10 +31,10 @@ A WPF application used to configure and monitor the LUT application status.
 - **Per-Monitor Calibration**: Detects all connected monitors and allows assigning a different `.cube` file to each. LUTs are keyed by the monitor's **desktop position** (e.g. `-1280_0.cube`); the "#" row shows a stable, globally-unique display index (independent of per-adapter source IDs).
 - **Comprehensive monitor table**: Properties are rows and each monitor is a column, so the labels read in full and a machine's handful of displays sit side by side. Every column is self-contained — its own SDR and HDR LUT pickers with **Browse / Next / Clear** — so there is no "selected monitor" mode.
 - **Display naming**: Monitor names come from each display's EDID. Internal laptop panels commonly ship an EDID with no product-name descriptor, so they are labelled **"Internal Display"** (detected from the connection type) rather than shown blank; other displays with no EDID name fall back to `???`.
-- **UAC Bypass Autostart**: Uses Windows Task Scheduler to launch with highest privileges on system logon.
+- **UAC Bypass Autostart**: Uses Windows Task Scheduler to launch with highest privileges on system logon, so no UAC prompt appears each time. Offered once on first run and reversible thereafter from the **Autostart** label and **Turn on / Turn off** button beside the hotkey selector; the displayed state is read from the actual scheduled task rather than remembered, so it stays correct even if the task is removed outside the app.
 - **DLL Injection**: Automates the `CreateRemoteThread` injection process into `dwm.exe`.
 - **Minimized Operation**: Runs in the system tray to keep LUTs active without cluttering the taskbar.
-- **HDR awareness**: Detects each display's current HDR (advanced-color) state, shows it in the monitor list's **Mode** column, and warns if you assign a LUT that can't apply in that mode (e.g. an SDR LUT to an HDR display). A LUT is applied only when its type matches the display's mode (see *HDR / SDR LUT selection*).
+- **Advanced-colour awareness**: Detects each display's current advanced-colour mode — **SDR**, **WCG** or **HDR** — shows it in the monitor list's **Mode** row, and warns if you assign a LUT that can't apply in that mode (e.g. an SDR LUT to an HDR display). A LUT is applied only when its type matches the display's mode (see *HDR / SDR LUT selection*). WCG appears when Windows' Auto Color Management puts an ordinary SDR display into advanced colour; it is not HDR, though it uses the same FP16 composition path and therefore the same LUT slot.
 - **SDR-in-HDR gamma fix**: Optional **On / Off** control, with a target-gamma dropdown (2.2 / 2.4 / 2.6, default 2.4), that patches DWM's SDR→scRGB conversion shaders so SDR content is mapped into the HDR space with a pure power curve instead of the piecewise sRGB curve Windows uses, which otherwise lifts near-blacks and washes SDR content out in HDR mode. Native HDR content is unaffected, and the fix is independent of the LUT (see *SDR-in-HDR gamma fix* below).
 
 #### Project Layout:
@@ -42,7 +42,8 @@ A WPF application used to configure and monitor the LUT application status.
 - `DwmLutGUI/MonitorData.cs`: Per-monitor model (identity, LUT paths, display index).
 - `DwmLutGUI/Injector.cs`: Handles process discovery and DLL injection.
 - `DwmLutGUI/MainViewModel.cs`: Core application logic, monitor enumeration, and config persistence.
-- `DwmLutGUI/HdrInfo.cs`: Queries Windows for each display's HDR (advanced-color) state.
+- `DwmLutGUI/HdrInfo.cs`: Queries Windows for each display's advanced-colour mode (SDR / WCG / HDR).
+- `DwmLutGUI/SingleInstance.cs`: Forwards a second launch's command-line arguments to the instance already running.
 - `DwmLutGUI/EotfPatcher.cs`: Applies the SDR-in-HDR gamma fix by patching DWM's shader bytecode in memory.
 - `DwmLutGUI/GuiDiag.cs`: Optional GUI-side diagnostic log (default off).
 
@@ -50,7 +51,7 @@ A WPF application used to configure and monitor the LUT application status.
 
 ## Technical Deep Dive: Windows 11 25H2 Support
 
-Windows 11 Build 26200 (25H2) significantly refactored DWM's internal structures. This build addresses those changes for `dwmcore.dll` 10.0.26100.8246, 10.0.26100.8655 and 10.0.26100.8875 as follows.
+Windows 11 build 26200 (25H2) significantly refactored DWM's internal structures. This build addresses those changes for `dwmcore.dll` 10.0.26100.8246, 10.0.26100.8655 and 10.0.26100.8875 as follows.
 
 ### Per-Monitor Identification
 Each overlay composition context reports **local, origin-`(0,0)` coordinates at native resolution** — not its global desktop position — so monitors cannot be told apart by the context's clip rectangle directly. 
@@ -84,7 +85,7 @@ Multiple adapter devices are held **simultaneously** — a hybrid laptop composi
 Each supported `dwmcore.dll` build is one **`DwmProfile`** row in `g_dwmProfiles[]`, and every row is self-contained: the dwmcore version, the four AOB signatures (embedded inline as fixed-size byte arrays, `'?'` = wildcard), and the build-specific offsets (clip-box + device-vector). At load, the engine reads the running `dwmcore.dll`'s file version and selects the newest row whose minimum version it satisfies (newest-first; a version-read failure falls back to the newest row; an unmatched build is skipped). Four builds are currently profiled — **26100.8246**, **26100.8655**, **26100.8875** and **26100.8935** — which all share identical signatures but differ in their device-vector addresses, and, from 8935 onwards, in the clip-box offset too. Supporting a future build is a single new row (the 24H2 / 23H2 / legacy paths are not part of this table and are unchanged).
 
 ### HDR / SDR LUT selection
-DWM composites an HDR display into an FP16 (scRGB) backbuffer and an SDR display into an 8/10-bit backbuffer, and the shader applies the LUT through an HDR (PQ/BT.2100) or SDR path accordingly — so a LUT is only valid for the mode it was calibrated in. The engine matches **exactly**: an HDR context takes the HDR LUT, an SDR context takes the SDR LUT. If the only LUT assigned to a display is the wrong type for its current mode, **no LUT is applied** rather than a mismatched one (which, run through the other path, would produce wrong colors). Use an HDR LUT (a `.cube` with `hdr` in the filename, calibrated in HDR) for a display in HDR mode, and an SDR LUT for SDR mode.
+DWM composites an HDR display into an FP16 (scRGB) backbuffer and an SDR display into an 8/10-bit backbuffer, and the shader applies the LUT through an HDR (PQ/BT.2100) or SDR path accordingly — so a LUT is only valid for the mode it was calibrated in. The engine matches **exactly**: an HDR context takes the HDR LUT, an SDR context takes the SDR LUT. If the only LUT assigned to a display is the wrong type for its current mode, **no LUT is applied** rather than a mismatched one (which, run through the other path, would produce wrong colors). Use an HDR LUT (a `.cube` with `hdr` in the filename, calibrated in HDR) for a display in HDR mode, and an SDR LUT for SDR mode. A display in **WCG** mode (Auto Color Management on an SDR display) composites in FP16 like an HDR one, so it takes the **HDR** LUT slot — but the surface is not PQ-encoded the way true HDR10 is, so a LUT authored for an HDR10 display will not be correct there.
 
 ### Fullscreen Device-Lost Handling
 Recent DWM builds run a **resource-leak checker** that deliberately breaks (`int 3`, crashing DWM) if it destroys one of its internal D3D devices while resources are still alive on it. 
@@ -147,12 +148,20 @@ This is corrected by rewriting the four sRGB constants inside DWM's own SDR→sc
 
 ---
 
+## Command line and single instance
+
+`-apply`, `-disable`, `-minimize` and `-exit` may be combined. `-apply` / `-disable` are mutually exclusive and act first; `-exit` is evaluated next and quits regardless of the other flags; `-minimize` folds the window to the tray. Matching is exact and case-sensitive — `-apply` works, `-Apply` does not.
+
+Only one instance may run, because it owns the injected DLL and the tray icon. A second launch **with** arguments does not start a second copy: it forwards them over a session-scoped named pipe to the instance already running, which acts on them, and then exits silently — so the flags above keep working while the tool sits in the tray, and a script is never left waiting on a dialog. A second launch with **no** arguments shows a "Single instance guard" notice instead. A forwarded `-apply` deliberately does not raise the window.
+
 ## Known Limitations
 
 - **Binary-version lock:** Signatures and offsets are valid for `dwmcore.dll` 10.0.26100.8246, 10.0.26100.8655, 10.0.26100.8875 (Windows 11 25H2, builds 26200.8246 / 8655 / 8875) and 10.0.26100.8935 (Windows 11 26H2 preview, build 26300), ImageBase `0x180000000`, thus the tool is not guaranteed to work on older 25H2 builds for which LUT application is skipped entirely as a safety measure. The 8935 profile is derived from a **preview** build and may need revisiting when 26H2 ships. 
   Support for older Windows versions (20H2, 21H1, 22H2, 23H2, 24H2) has been kept but not evaluated; 21H2 (22000) is hardware-validated.
 - **Static C++ runtime (build requirement):** the injector links the C++ runtime statically (`/MT`), so `lutdwm.dll` carries no dependency on the target's `msvcp140.dll` / VC++ redistributable. A dynamic-CRT (`/MD`) build made with the VS2022 17.10+ toolset crashes in `msvcp140!mtx_do_lock` — a null dereference inside `std::mutex::lock`, on the first mutex taken in the LUT path — on any machine whose VC++ runtime predates 14.40, because that toolset's `constexpr` `std::mutex` layout is incompatible with the older runtime. This is unrelated to the dwmcore version; static linking removes it outright.
 - **SDR-in-HDR gamma fix restarts DWM:** Because DWM builds its pixel shaders at startup, switching the fix on or off requires a fresh DWM — a brief black flash, and any per-session compositor state is rebuilt. Consecutive toggles are therefore rate-limited (the buttons are disabled with a short countdown between them): restarting the display pipeline several times in quick succession has been observed to leave a multi-monitor setup in a bad state, with a display dropping out and scaling/HDR reset until reconnected or rebooted. Set the fix once rather than toggling it repeatedly. The patch is memory-only — it never modifies `dwmcore.dll` on disk and is gone after any DWM restart or reboot — so a normal LUT Apply / Disable, which does *not* restart DWM, will not carry it over.
+- **A WCG display needs its own LUT, not an HDR10 one:** when Auto Color Management puts an SDR display into WCG (advanced color), Windows composites it into the same FP16 (scRGB) surface as HDR, so the LUT is taken from the **HDR** slot and the shader applies it in the PQ / BT.2100 domain. The panel is still a wide-gamut display at SDR luminance, though, not an HDR10 one — its peak luminance and response are different — so a LUT authored for, or measured on, a genuine HDR10 display will not be correct there. A LUT for a WCG display has to be measured on that display while it is in WCG mode. Turning "Automatically manage color for apps" off returns the display to plain SDR and to the SDR LUT slot.
+- **Autostart needs the scheduled task to be creatable:** autostart is a Task Scheduler entry running with highest privileges (a plain `Run` registry entry would prompt for UAC at every logon, since the app requires administrator rights). If policy or an error prevents `schtasks` from registering it, the failure is reported and the setting stays off rather than silently appearing to have worked. The task carries a 15-second delay, because logon fires before the display topology has settled and applying immediately can run against monitors that are not yet enumerated.
 - **Crash proof, update vulnerable:** When a Windows update breaks the tool, the symptom points to the cause:
   - *Nothing happens at all* → a `COverlayContext` **signature** moved (most likely `Present`), or the running dwmcore has **no matching profile**.
   - *Wrong monitor / wrong colors, or only the primary display gets its LUT* → the clip-box **offset** moved (per build: `0x7658` on 8246 / 8655 / 8875, `0x7648` on 8935), or `GetBackBuffer_25H2`'s `vt[24]`/`vt2[19]` indices moved. Note that dwmcore also carries a monitor-**local** clip box a few fields away that always reads `(0,0)`; picking that one by mistake makes every display collide on one origin, so only the primary is color-managed. The `DIAG_MONITOR_MATCH` build switch dumps every clip-box-shaped RECT per context and is the reliable way to tell them apart on a multi-monitor layout.
@@ -165,4 +174,4 @@ This is corrected by rewriting the four sRGB constants inside DWM's own SDR→sc
 
 ---
 
-*Last Updated: 31 July 2026*
+*Last Updated: 4 August 2026*

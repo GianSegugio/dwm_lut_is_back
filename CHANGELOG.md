@@ -8,6 +8,41 @@ This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246**, **10.0.26
 ---
 ---
 
+## v1.2.1
+
+### GUI — display mode is reported accurately (`HdrInfo.cs`, `MonitorData.cs`)
+- **Was:** a display's mode came from the `advancedColorEnabled` bit of the legacy `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO`, and anything with that bit set was labelled **HDR**. Since Windows 11 24H2, Auto Color Management ("Automatically manage color for apps") also puts ordinary **SDR** displays into advanced colour, so that bit is set for displays that have no HDR mode at all — a plain SDR monitor could show up as HDR.
+- **Is:** the mode is read from `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2`, whose `activeColorMode` distinguishes **SDR / WCG / HDR** properly. The Mode row now shows `WCG (advanced color)` for an SDR display running under ACM. On builds that predate that call, the query falls back to the legacy bit and reports HDR as before — it cannot tell WCG from HDR, which is exactly the limitation being fixed.
+- **LUT behaviour is unchanged.** Advanced colour of either kind composites in FP16, which is what the injector keys the HDR LUT slot off, so a WCG display still uses the HDR LUT. Only the label was wrong. Note that a WCG surface is *not* PQ-encoded like true HDR10, so a LUT for such a display should be authored accordingly.
+- **WCG gets its own mismatch warning.** Assigning an **SDR** LUT to a WCG display now explains that WCG, while not HDR, is composited into the same FP16 surface and therefore uses the **HDR** LUT slot — so the SDR LUT will have no effect — and points at "Automatically manage color for apps" rather than the HDR toggle. Previously it reused the HDR wording and told the user to disable an HDR mode the display does not have. Assigning an HDR LUT to a WCG display is silent, since that is the slot which applies.
+
+### GUI — autostart
+- **Failures are no longer silent.** `schtasks` was launched fire-and-forget through the shell with no exit code checked, so a failed registration was invisible and the choice was recorded as made regardless. It now runs directly (the app is already elevated, so no re-elevation is needed), the exit code and error text are checked, and the answer is only remembered once autostart is genuinely in place.
+- **Answering "No" now removes an existing task.** The removal path existed but was never called, so declining left a task from a previous install in place and the app kept starting itself.
+- **The task itself is more robust:** `/delay 0000:15` (logon fires before the display topology has settled, and applying immediately can run against monitors that are not enumerated yet), `/ru` + `/it` so the trigger is bound to this user and uses their interactive token — no stored password, and no hidden password prompt that could hang — and the executable path is taken from the running process rather than derived from the assembly location. Creation tries these switches and falls back to the previous, simpler command if an older `schtasks` rejects them, so it can never end up worse off.
+- **The choice is now reversible.** An **Autostart (enabled/disabled):** label and a **Turn on / Turn off** button sit beside the hotkey selector. The state is read from the actual scheduled task rather than remembered, so it stays correct if the task is removed elsewhere; turning it on re-registers with `/f`, which also repairs a stale task after the executable is moved.
+
+### GUI — a second launch now hands its arguments to the running instance (`SingleInstance.cs`)
+- **Was:** only one instance may run, and a second launch was refused with a modal "Already running!" dialog *before* any argument was looked at. With autostart enabled there is nearly always an instance in the tray, so the documented automation flags were unusable — and in a script or scheduled task the modal had nobody to dismiss it and blocked the launch indefinitely.
+- **Is:** a second launch with arguments forwards them over a session-scoped named pipe and exits silently; the running instance acts on them. A second launch with no arguments still shows the notice, now titled **Single instance guard**. A named pipe is used rather than a window message because the running instance is normally hidden in the tray.
+- Startup and forwarded arguments share one routine, so both honour exactly the same flags and precedence. A forwarded `-apply` deliberately does not raise the window — a script re-applying LUTs should not steal focus.
+
+### Fixes
+- **`-exit` was ignored when combined with `-minimize`.** The two sat in the same `if`/`else if`, so `-apply -minimize -exit` applied the LUT and then stayed in the tray instead of quitting. `-exit` is now independent and evaluated first.
+- **Crash while staging LUT files.** Removing the staging folder could throw *"The process cannot access the file '0_0.cube' because it is being used by another process"* and take the app down — the staged `.cube` files are read by `dwm.exe` and are freshly-written files in a temp directory, so a real-time AV scanner or the compositor finishing with them can hold a handle momentarily. Removal now retries briefly and, failing that, deletes the individual files so a stale LUT can never be picked up by the next injection.
+- **The tray icon needed two double-clicks after an autostart.** Starting with `-minimize` leaves the window minimized for the whole session, so showing it before restoring its state made it briefly visible in a minimized state — which the minimize-to-tray handler immediately folded away again. Restoring now happens after showing, guarded so the handler cannot undo it, and the window is activated so it comes to the front rather than returning behind whatever has focus. A tray double-click now always brings it back on screen, whatever state it was folded away in.
+
+### GUI — controls gate on each other
+- Apply / Disable, the gamma On / Off pair and the autostart button are now all disabled while any of those operations is running. None of them can truly overlap (each is synchronous), but a gamma toggle freezes the UI for a few seconds and clicks landing in that window were delivered afterwards — most visibly, a double-click on the autostart button toggled it twice. Those clicks now land on a disabled control and are discarded.
+- Apply deliberately stays available while a LUT is active: it doubles as "re-apply", which is what the **Active (changed)** status prompts after a LUT is picked from a dropdown.
+
+### GUI — status line and scrollbars
+- **The status line now accounts for the gamma fix.** It read `Inactive` whenever no LUT was applied, even with the gamma fix live and correcting the display. It now reads **Active** when either correction is in effect and **Inactive** only when both are off. The `(changed)` hint stays tied to the LUT, since it means "press Apply to re-apply" and would point at nothing with no LUT applied. The Disable button is deliberately left tracking the LUT alone: it unloads the LUT and cannot switch the gamma fix off, which needs a DWM restart via the gamma **Off** button.
+- **Scrollbars follow the theme.** There was no `ScrollBar` style, so the bars that appear when the window is resized smaller than the monitor table fell back to the default Windows chrome — wide, light and with stepper arrows against a `#121212` window. They are now a thin overlay-style bar: no arrows, a rounded thumb that brightens on hover and while dragging, and a transparent but still clickable track for paging. Being an implicit style, it covers the LUT dropdown popups as well as the monitor table.
+
+---
+---
+
 ## v1.2.0
 
 ### New feature — SDR-in-HDR gamma fix (`DwmLutGUI/EotfPatcher.cs`)
@@ -281,4 +316,4 @@ Windows composites SDR content into the HDR (scRGB) space using the **piecewise 
 
 ---
 
-*Last Updated: 31 July 2026*
+*Last Updated: 4 August 2026*

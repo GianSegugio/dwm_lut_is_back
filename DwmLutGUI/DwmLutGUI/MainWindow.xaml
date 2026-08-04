@@ -5,7 +5,7 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:DwmLutGUI"
         mc:Ignorable="d"
-        Title="DwmLutGUI" Height="420" Width="840" MinHeight="320" MinWidth="720">
+        Title="DwmLutGUI" Height="420" Width="960" MinHeight="320" MinWidth="840">
     <Window.DataContext>
         <local:MainViewModel />
     </Window.DataContext>
@@ -54,10 +54,19 @@
             <Grid DockPanel.Dock="Bottom" Margin="0,6,0,0">
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Bottom">
                     <Button Content="About" Width="75" Click="AboutButton_Click" />
-                    <TextBlock Text="Hotkey" VerticalAlignment="Center" Margin="12,0,6,0" />
+                    <TextBlock Text="Hotkey:" VerticalAlignment="Center" Margin="12,0,6,0" />
                     <ComboBox x:Name="ToggleKeyCombo" SelectedItem="{Binding ToggleKey}" MinWidth="110"
                               VerticalAlignment="Center"
                               ToolTip="Global key that applies or disables all LUTs" />
+                    <!-- Same 12px lead-in and 6px trailing gap as the "Hotkey:" label, so both
+                         label/control pairs are spaced identically. No fixed width: that would push
+                         the text off a constant left edge, and matching the lead-in matters more than
+                         the ~6px the button shifts when the label flips between the two states. -->
+                    <TextBlock Text="{Binding AutostartLabel}" VerticalAlignment="Center"
+                               Margin="12,0,6,0" />
+                    <Button Content="{Binding AutostartButtonText}" MinWidth="80"
+                            IsEnabled="{Binding CanToggleAutostart}" Click="AutostartToggle_Click"
+                            ToolTip="Start DwmLut automatically at logon (a scheduled task running with the privileges the injector needs, so no UAC prompt each time). Changing this needs administrator rights." />
                 </StackPanel>
                 <Grid HorizontalAlignment="Right">
                     <Grid.ColumnDefinitions>
@@ -87,10 +96,10 @@
 
                     <TextBlock Grid.Row="1" Grid.Column="1" Text="LUT:" VerticalAlignment="Center"
                                TextAlignment="Right" Margin="0,0,6,0" />
-                    <Button Grid.Row="1" Grid.Column="2" IsEnabled="{Binding CanApply}" Content="Apply"
+                    <Button Grid.Row="1" Grid.Column="2" IsEnabled="{Binding CanApplyLut}" Content="Apply"
                             Width="75" Margin="0,0,6,0" Click="Apply_Click" />
                     <Button Grid.Row="1" Grid.Column="3" Content="Disable" Width="75"
-                            IsEnabled="{Binding IsActive}" Click="Disable_Click" />
+                            IsEnabled="{Binding CanDisableLut}" Click="Disable_Click" />
                 </Grid>
             </Grid>
 

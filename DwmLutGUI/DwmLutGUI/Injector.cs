@@ -446,6 +446,54 @@ namespace DwmLutGUI
         }
 
         /// <summary>
+        /// Removes the staging folder, tolerating a file that is momentarily still open.
+        ///
+        /// `Directory.Delete` here used to be able to take the whole app down with
+        /// "The process cannot access the file '0_0.cube' because it is being used by another
+        /// process". The staged .cube files are read by dwm.exe and are also freshly-written files
+        /// in a temp directory, so a real-time AV scanner or a compositor still finishing with them
+        /// can hold a handle for a moment. This is a temp folder - failing to remove it is never
+        /// worth an unhandled exception.
+        ///
+        /// If the folder itself cannot go, the individual files are removed best-effort so a stale
+        /// LUT from a previous run can never be picked up by the next injection.
+        /// </summary>
+        private static void ClearLutsFolder()
+        {
+            for (var attempt = 0; attempt < 10; attempt++)
+            {
+                try
+                {
+                    if (!Directory.Exists(LutsPath)) return;
+                    Directory.Delete(LutsPath, true);
+                    return;
+                }
+                catch (IOException)
+                {
+                    System.Threading.Thread.Sleep(50);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    System.Threading.Thread.Sleep(50);
+                }
+            }
+
+            var stragglers = 0;
+            try
+            {
+                foreach (var f in Directory.GetFiles(LutsPath))
+                {
+                    try { File.Delete(f); }
+                    catch { stragglers++; }
+                }
+            }
+            catch { }
+
+            GuiDiag.Log("[stage] LUT folder still in use after retries; " +
+                        (stragglers == 0 ? "contents cleared instead" : stragglers + " file(s) left behind"));
+        }
+
+        /// <summary>
         /// Stages everything the injected DLL will need: a private copy of dwm_lut.dll and the
         /// per-monitor .cube files, with their DACLs cleared so DWM (running as SYSTEM) can read
         /// them. Nothing here depends on DWM, so when a restart is involved this must be done
@@ -479,10 +527,7 @@ namespace DwmLutGUI
 
             ClearPermissions(DllPath);
 
-            if (Directory.Exists(LutsPath))
-            {
-                Directory.Delete(LutsPath, true);
-            }
+            ClearLutsFolder();
 
             Directory.CreateDirectory(LutsPath);
             ClearPermissions(LutsPath);
@@ -536,10 +581,7 @@ namespace DwmLutGUI
                 dwm.Dispose();
             }
 
-            if (Directory.Exists(LutsPath))
-            {
-                Directory.Delete(LutsPath, true);
-            }
+            ClearLutsFolder();
 
             if (!failed)
             {

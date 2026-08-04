@@ -32,7 +32,7 @@ Right now it should work on 20H2, 21H1, 21H2, 22H2, 23H2, 24H2, 25H2 builds >= 2
 - **Fail-safe by design:** A process-wide kill-switch and structured-exception boundaries around the render path keep any failure contained; DWM composites normally instead of crash-looping.
 - **MPO / DirectFlip Management**: Automated `OverlayTestMode` handling for *windowed -> borderless -> direct-fullscreen-composition* transitions, plus a **composition-blocker overlay** that (only when a fullscreen app is detected on a monitor with an applicable LUT) forces that display to composite so the LUT applies to fullscreen/borderless apps that would otherwise IndependentFlip. Per-monitor, DPI-correct, and removed as soon as fullscreen ends. In summary, LUTs apply to composited surfaces (windowed apps, most fullscreen video, and legacy fullscreen games). **Fullscreen or borderless games that DWM promotes to IndependentFlip (direct scanout) bypass composition and will not show the LUT**; this is a DWM limitation with no compositor-side hook on 25H2. For those, an in-game overlay such as [ImGui](https://github.com/ocornut/imgui) is the right approach.
 - **SDR-in-HDR gamma fix**: In HDR mode Windows maps SDR content with the piecewise sRGB curve rather than the pure gamma curve content is actually graded against, which lifts blacks and washes it out — with no Windows setting to change it. An optional **On / Off** control patches DWM's own SDR-to-HDR conversion shaders to a pure gamma curve of your choice (2.2 / 2.4 / 2.6, default 2.4), correcting SDR content while leaving **native HDR content untouched**. It is independent of the LUT, so correctly-mapped SDR and a calibrated HDR display work at the same time. Toggling it restarts DWM (a brief black flash) and changes nothing on disk.
-- **Improved UI**: A comprehensive monitor table — properties are labelled rows, each monitor is a self-contained column — with per-monitor SDR/HDR LUT dropdowns and Browse / Next / Clear actions, a live per-monitor Status (inactive / active windowed / active fullscreen), and a global Apply/Disable hotkey.
+- **Improved UI**: A comprehensive monitor table — properties are labelled rows, each monitor is a self-contained column — with per-monitor SDR/HDR LUT dropdowns and Browse / Next / Clear actions, a live per-monitor Status (inactive / active windowed / active fullscreen), a per-display Mode (SDR / WCG / HDR), a global Apply/Disable hotkey, and an autostart toggle.
 - **Enhanced .cube Parser**: Support for DisplayCAL generated LUTs, including negative values and floating-point data.
 
 ## Usage
@@ -41,9 +41,10 @@ Use [DisplayCAL](https://displaycal.net/) or similar to generate .cube LUT files
 For [ColourSpace](https://lightillusion.com/colourspace.html) users with HT license level, 65^3 eeColor LUT .txt files are also supported.
 
 HDR LUTs must use BT.2020 + SMPTE ST 2084 values as input and output.
+
 If you use HDR and want SDR → HDR mapped content to follow the pure gamma curve it was authored for, instead of the piecewise sRGB curve Windows uses by default, turn the **scRGB piecewise → scRGB 2.x (HDR gamma fix)** on and pick the target gamma (2.2 / 2.4 / 2.6) from the dropdown beside it. It corrects how Windows maps SDR content into the HDR space and leaves native HDR content alone, so it can be used together with a calibrated HDR LUT. It restarts DWM each time it is switched, so set it once rather than toggling it repeatedly.
 
-Minimizing the GUI will make it disappear from the taskbar, and you can use the context menu of the tray icon to quickly apply or disable all LUTs. For automation, you can start the exe with any (sensible) combination of `-apply`,  `-disable`, `-minimize` and `-exit` as arguments.
+Minimizing the GUI will make it disappear from the taskbar, and you can use the context menu of the tray icon to quickly apply or disable all LUTs. For automation, you can start the exe with any (sensible) combination of `-apply`, `-disable`, `-minimize` and `-exit` as arguments (exact and case-sensitive: `-apply`, not `-Apply`). If DwmLut is already running — as it will be with autostart enabled — the arguments are handed to that instance and the second launch exits silently, so scripts and scheduled tasks keep working without a second copy or a dialog to dismiss.
 
 ## Compiling
 Install [vcpkg](https://vcpkg.io/en/getting-started.html) for C++ dependency management:
@@ -69,4 +70,4 @@ See [documentation](DOCUMENTATION.md) for technical info and known limitations.
 
 ---
 
-*Last Updated: 31 July 2026*
+*Last Updated: 4 August 2026*

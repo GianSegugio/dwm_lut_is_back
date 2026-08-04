@@ -135,6 +135,30 @@ namespace DwmLutGUI
             get => _toggleKey;
         }
 
+        private bool _autostartEnabled;
+
+        /// <summary>
+        /// Whether the autostart scheduled task currently exists. Set from the real task state rather
+        /// than remembered, so the control still tells the truth if the task is removed elsewhere
+        /// (Task Scheduler, an uninstall, a different machine profile).
+        /// </summary>
+        public bool AutostartEnabled
+        {
+            get => _autostartEnabled;
+            set
+            {
+                if (_autostartEnabled == value) return;
+                _autostartEnabled = value;
+                OnPropertyChanged(nameof(AutostartEnabled));
+                OnPropertyChanged(nameof(AutostartLabel));
+                OnPropertyChanged(nameof(AutostartButtonText));
+            }
+        }
+
+        public string AutostartLabel => _autostartEnabled ? "Autostart (enabled):" : "Autostart (disabled):";
+
+        public string AutostartButtonText => _autostartEnabled ? "Turn off" : "Turn on";
+
         public bool AutostartAsked
         {
             set
@@ -154,11 +178,59 @@ namespace DwmLutGUI
                 if (value == _isActive) return;
                 _isActive = value;
                 OnPropertyChanged();
+                OnPropertyChanged(nameof(CanDisableLut));
             }
             get => _isActive;
         }
 
+        /// <summary>
+        /// Static capability: this process holds the privilege needed to inject and patch at all.
+        /// Deliberately NOT "the Apply button should be clickable right now" - the gamma controls
+        /// depend on this too, and folding button state into it would silently gate them as well.
+        /// </summary>
         public bool CanApply { get; }
+
+        private bool _autostartOpInProgress;
+
+        /// <summary>
+        /// True while a gamma toggle or an autostart change is running. Every one of these operations
+        /// is synchronous on the UI thread, so they can never truly overlap - but a gamma toggle
+        /// freezes the UI for seconds, and any click landing in that window is delivered afterwards.
+        /// Gating on this makes those clicks land on a disabled control and be discarded instead.
+        /// </summary>
+        public bool IsBusy => _gammaOpInProgress || _autostartOpInProgress;
+
+        /// <summary>
+        /// Apply stays available while a LUT is active: it doubles as "re-apply", which is what the
+        /// "Active (changed)" status prompts after a LUT is picked from a dropdown.
+        /// </summary>
+        public bool CanApplyLut => CanApply && !IsBusy;
+
+        public bool CanDisableLut => IsActive && !IsBusy;
+
+        public bool CanToggleAutostart => !IsBusy;
+
+        /// <summary>Set around an autostart change so the other controls gate on it.</summary>
+        public bool AutostartOpInProgress
+        {
+            get => _autostartOpInProgress;
+            set
+            {
+                if (_autostartOpInProgress == value) return;
+                _autostartOpInProgress = value;
+                RaiseBusyDependents();
+            }
+        }
+
+        private void RaiseBusyDependents()
+        {
+            OnPropertyChanged(nameof(IsBusy));
+            OnPropertyChanged(nameof(CanApplyLut));
+            OnPropertyChanged(nameof(CanDisableLut));
+            OnPropertyChanged(nameof(CanToggleAutostart));
+            OnPropertyChanged(nameof(CanEnableGammaFix));
+            OnPropertyChanged(nameof(CanDisableGammaFix));
+        }
 
         /// <summary>
         /// SDR-in-HDR gamma fix: patches DWM's SDR-to-scRGB shaders to a pure 2.2 curve.
@@ -232,11 +304,11 @@ namespace DwmLutGUI
 
         /// <summary>"On" is available only when the fix isn't already live and we are ready.</summary>
         public bool CanEnableGammaFix =>
-            CanApply && !_gammaFixActive && !_gammaOpInProgress && !GammaFixCoolingDown;
+            CanApply && !_gammaFixActive && !IsBusy && !GammaFixCoolingDown;
 
         /// <summary>"Off" mirrors it: only when the fix IS live and we are ready.</summary>
         public bool CanDisableGammaFix =>
-            _gammaFixActive && !_gammaOpInProgress && !GammaFixCoolingDown;
+            _gammaFixActive && !IsBusy && !GammaFixCoolingDown;
 
         /// <summary>Row label, with a note while the buttons are held back so the wait is explained.</summary>
         public string GammaFixLabel
@@ -363,7 +435,7 @@ namespace DwmLutGUI
             // hybrid multi-GPU laptops, producing "1, 1, 2").
             var displayIndex = 0;
 
-            var hdrStates = HdrInfo.GetHdrStates();   // device path -> currently in HDR mode
+            var colorModes = HdrInfo.GetColorModes(); // device path -> SDR / WCG / HDR
             foreach (var path in paths)
             {
                 if (path.IsCloneMember) continue;
@@ -427,8 +499,13 @@ namespace DwmLutGUI
                 };
                 if (sdrLutPaths != null) monitor.SdrLuts = new ObservableCollection<string>(sdrLutPaths);
                 if (hdrLutPaths != null) monitor.HdrLuts = new ObservableCollection<string>(hdrLutPaths);
-                bool isHdr;
-                monitor.IsHdr = !string.IsNullOrEmpty(devicePath) && hdrStates.TryGetValue(devicePath, out isHdr) && isHdr;
+                AdvancedColorMode mode;
+                if (string.IsNullOrEmpty(devicePath) || !colorModes.TryGetValue(devicePath, out mode))
+                    mode = AdvancedColorMode.Sdr;
+                monitor.ColorMode = mode;
+                // Advanced colour of either kind means FP16 composition, which is what the injector
+                // keys the HDR LUT slot off - so WCG counts as "HDR" for LUT purposes.
+                monitor.IsHdr = mode != AdvancedColorMode.Sdr;
                 _allMonitors.Add(monitor);
                 Monitors.Add(monitor);
             }
@@ -482,7 +559,7 @@ namespace DwmLutGUI
         /// <summary>Turn the gamma fix on. Leaves the LUT exactly as it was.</summary>
         public void EnableGammaFix()
         {
-            if (_gammaOpInProgress || GammaFixCoolingDown)
+            if (IsBusy || GammaFixCoolingDown)
             {
                 GuiDiag.Log("gamma ON ignored (operation in progress or cooling down)");
                 return;
@@ -496,7 +573,7 @@ namespace DwmLutGUI
         /// <summary>Turn the gamma fix off. Leaves the LUT exactly as it was.</summary>
         public void DisableGammaFix()
         {
-            if (_gammaOpInProgress || GammaFixCoolingDown)
+            if (IsBusy || GammaFixCoolingDown)
             {
                 GuiDiag.Log("gamma OFF ignored (operation in progress or cooling down)");
                 return;
@@ -515,8 +592,7 @@ namespace DwmLutGUI
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
             _gammaOpInProgress = true;
-            OnPropertyChanged(nameof(CanEnableGammaFix));
-            OnPropertyChanged(nameof(CanDisableGammaFix));
+            RaiseBusyDependents();
 
             _suppressDisplayEvents = true;
             try
@@ -532,6 +608,7 @@ namespace DwmLutGUI
             {
                 _suppressDisplayEvents = false;
                 _gammaOpInProgress = false;
+                RaiseBusyDependents();
                 // Invalidate the published values so the next tick definitely republishes.
                 _lastGammaLabel = null;
                 _lastCanEnableGamma = null;
@@ -617,10 +694,17 @@ namespace DwmLutGUI
             var status = Injector.GetStatus();
             if (status != null)
             {
+                // IsActive stays LUT-specific: it gates the Disable button, which unloads the LUT and
+                // cannot turn the gamma fix off (that needs a DWM restart via the gamma Off button).
                 IsActive = (bool)status;
-                if (status == true)
+
+                // The status line is the broader "is this tool doing anything" indicator, so either
+                // correction counts. The "(changed)" hint stays tied to the LUT, since it means
+                // "press Apply to re-apply" and would be meaningless with no LUT applied.
+                var lutActive = status == true;
+                if (lutActive || GammaFixActive)
                 {
-                    ActiveText = "Active" + (_configChanged ? " (changed)" : "");
+                    ActiveText = "Active" + (lutActive && _configChanged ? " (changed)" : "");
                 }
                 else
                 {

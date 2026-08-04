@@ -14,6 +14,7 @@ using System.Windows.Input;
 using Microsoft.Win32;
 using System.Windows.Interop;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Net;
 using System.Text.RegularExpressions;
 using ContextMenu = System.Windows.Forms.ContextMenu;
@@ -122,9 +123,28 @@ namespace DwmLutGUI
         {
             try
             {
+                var args = Environment.GetCommandLineArgs().ToList();
+                args.RemoveAt(0);
+
                 if (Process.GetProcessesByName(Process.GetCurrentProcess().ProcessName).Length > 1)
                 {
-                    MessageBox.Show("Already running!");
+                    // Hand the flags to the instance that is already running rather than refusing:
+                    // with autostart on there is nearly always one in the tray, which used to make
+                    // the documented automation flags unusable. Deliberately silent - a script has
+                    // nobody to dismiss a dialog, and a modal here would block the launch forever.
+                    if (args.Count > 0)
+                    {
+                        SingleInstance.SendToRunningInstance(args);
+                    }
+                    else
+                    {
+                        MessageBox.Show(
+                            "There is an instance of the tool already running.",
+                            "Single instance guard",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information);
+                    }
+
                     Close();
                     return;
                 }
@@ -134,39 +154,13 @@ namespace DwmLutGUI
                 _viewModel = (MainViewModel)DataContext;
                 _applyOnCooldown = false;
 
-                var args = Environment.GetCommandLineArgs().ToList();
-                args.RemoveAt(0);
-
-                if (args.Contains("-apply"))
-                {
-                    Apply_Click(null, null);
-                }
-                else if (args.Contains("-disable"))
-                {
-                    Disable_Click(null, null);
-                }
-
-                if (args.Contains("-minimize"))
-                {
-                    WindowState = WindowState.Minimized;
-                    Hide();
-                }
-                else if (args.Contains("-exit"))
-                {
-                    Close();
-                    return;
-                }
+                if (ProcessArguments(args, true)) return;
 
                 var notifyIcon = new NotifyIcon();
                 var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("DwmLutGUI.smile.ico");
                 notifyIcon.Icon = new Icon(stream);
                 notifyIcon.Visible = true;
-                notifyIcon.DoubleClick +=
-                    delegate
-                    {
-                        Show();
-                        WindowState = WindowState.Normal;
-                    };
+                notifyIcon.DoubleClick += delegate { RestoreFromTray(); };
 
                 var contextMenu = new ContextMenu();
 
@@ -237,7 +231,15 @@ namespace DwmLutGUI
                 ToggleKeyCombo.SelectedItem = _viewModel.ToggleKey;
 
                 Closing += MainWindow_Closing;
+
+                // Now that the window can service them, accept arguments from any later launch.
+                SingleInstance.StartListener(
+                    forwarded => Dispatcher.Invoke(new Action(() => OnForwardedArguments(forwarded))));
+
                 CheckAutostart();
+
+                // Reflect the task's real state in the toggle (CheckAutostart may have just created it).
+                _viewModel.AutostartEnabled = AutostartTaskExists();
                 CheckForUpdates();
             }
             catch (Exception ex)
@@ -248,9 +250,49 @@ namespace DwmLutGUI
             }
         }
 
+        // Set while restoring from the tray, so the minimize-to-tray handler cannot fold the window
+        // away again mid-restore.
+        private bool _restoringFromTray;
+
+        /// <summary>
+        /// Brings the window back from the tray, always on screen and in front.
+        ///
+        /// A tray double-click should restore unconditionally, whatever state the window was folded
+        /// away in - whether that was the user minimising it, or -minimize at autostart (which leaves
+        /// WindowState = Minimized for the whole session).
+        ///
+        /// The restore has to happen AFTER Show(): assigning WindowState to a hidden window does not
+        /// reliably stick, because the underlying HWND is still carrying its minimized placement.
+        /// Showing first and restoring second is reliable, but it briefly puts the window on screen in
+        /// a minimized state - which is precisely what OnStateChanged folds away - hence the guard.
+        /// </summary>
+        private void RestoreFromTray()
+        {
+            _restoringFromTray = true;
+            try
+            {
+                Show();
+
+                // Maximized is left alone: it is already a perfectly visible state.
+                if (WindowState == WindowState.Minimized)
+                {
+                    WindowState = WindowState.Normal;
+                }
+
+                // Show() does not guarantee the foreground, so without this the window can come back
+                // behind whatever currently has focus - visible only as a taskbar button.
+                Activate();
+            }
+            finally
+            {
+                _restoringFromTray = false;
+            }
+        }
+
         protected override void OnStateChanged(EventArgs e)
         {
-            if (WindowState == WindowState.Minimized)
+            // Fold away only a window that is genuinely on screen and not one we are restoring.
+            if (WindowState == WindowState.Minimized && IsVisible && !_restoringFromTray)
             {
                 Hide();
             }
@@ -267,6 +309,63 @@ namespace DwmLutGUI
             }
         }
 
+        /// <summary>
+        /// Applies the documented command-line flags. Shared by startup and by a second launch whose
+        /// arguments were forwarded here, so both honour exactly the same set and precedence.
+        /// Returns true when the app should stop (-exit was given).
+        /// </summary>
+        /// <param name="atStartup">
+        /// True while still in the constructor, where the window has never been shown and the
+        /// Closing handler is not hooked up yet.
+        /// </param>
+        private bool ProcessArguments(IList<string> args, bool atStartup)
+        {
+            // Matching is deliberately exact and case-sensitive: "-apply" works, "-Apply" does not.
+            if (args.Contains("-apply"))
+            {
+                Apply_Click(null, null);
+            }
+            else if (args.Contains("-disable"))
+            {
+                Disable_Click(null, null);
+            }
+
+            // -exit is independent of -minimize and evaluated first: if we are quitting, the window
+            // state is irrelevant. It used to sit in an "else if" after -minimize, so
+            // "-apply -minimize -exit" silently ignored -exit and stayed in the tray.
+            if (args.Contains("-exit"))
+            {
+                // At startup the Closing handler is not attached yet, so Close() already works.
+                // Once running it would be cancelled and turned into a Hide(), hence the flag.
+                if (!atStartup) _isExiting = true;
+                Close();
+                return true;
+            }
+
+            if (args.Contains("-minimize"))
+            {
+                WindowState = WindowState.Minimized;
+
+                // At startup there is no HWND yet and the StartupUri Show() is still to come, so the
+                // window has to be hidden explicitly. Later on, OnStateChanged folds it to the tray.
+                if (atStartup) Hide();
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Arguments forwarded from a second launch. Note that a plain "-apply" deliberately does not
+        /// bring the window up: a script re-applying LUTs should not steal focus.
+        /// </summary>
+        private void OnForwardedArguments(string[] forwarded)
+        {
+            GuiDiag.Log("forwarded arguments received: " + string.Join(" ", forwarded));
+            ProcessArguments(forwarded.ToList(), false);
+        }
+
+        private const string AutostartTaskName = "DwmLutGUI_Autostart";
+
         private void CheckAutostart()
         {
             if (_viewModel.AutostartAsked) return;
@@ -279,65 +378,182 @@ namespace DwmLutGUI
 
             if (result == System.Windows.Forms.DialogResult.Yes)
             {
-                SetAutostart(true);
+                // Only remember the answer once autostart is actually in place. Recording it after a
+                // failure would leave the user believing autostart is on, with no way to revisit the
+                // question short of editing config.xml.
+                if (!SetAutostart(true)) return;
             }
-            
+            else
+            {
+                // Answering No must also undo a task left behind by a previous install, otherwise the
+                // app keeps starting itself in direct contradiction of the choice just made.
+                SetAutostart(false);
+            }
+
             _viewModel.AutostartAsked = true;
         }
 
-        private void SetAutostart(bool enable)
+        private void AutostartToggle_Click(object sender, RoutedEventArgs e)
+        {
+            if (_viewModel.IsBusy) return;   // a queued click from a frozen UI
+
+            var enable = !_viewModel.AutostartEnabled;
+
+            _viewModel.AutostartOpInProgress = true;
+            Cursor = System.Windows.Input.Cursors.Wait;
+            try
+            {
+                SetAutostart(enable);
+            }
+            finally
+            {
+                Cursor = null;
+                _viewModel.AutostartOpInProgress = false;
+
+                // Re-read the task rather than assume the request succeeded: SetAutostart reports its
+                // own failures, and the button must show what actually happened.
+                _viewModel.AutostartEnabled = AutostartTaskExists();
+
+                // Using the toggle is itself an answer, so the first-run question is settled.
+                _viewModel.AutostartAsked = true;
+            }
+        }
+
+        /// <summary>
+        /// Resolves this executable's own path. MainModule is authoritative; the assembly location is
+        /// only a fallback (and needs the .dll -> .exe swap on .NET Core-style hosts, done with
+        /// ChangeExtension so a directory containing ".dll" can't be mangled).
+        /// </summary>
+        private static string GetExecutablePath()
         {
             try
             {
-                
-                string runKeyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
-                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(runKeyPath, true))
+                using (var self = Process.GetCurrentProcess())
                 {
-                    key?.DeleteValue("DwmLutGUI", false);
+                    var path = self.MainModule?.FileName;
+                    if (!string.IsNullOrEmpty(path)) return path;
                 }
+            }
+            catch { }
 
-                string taskName = "DwmLutGUI_Autostart";
-                string exePath = Assembly.GetExecutingAssembly().Location;
-                
-                if (exePath.EndsWith(".dll")) exePath = exePath.Replace(".dll", ".exe");
+            var loc = Assembly.GetExecutingAssembly().Location;
+            if (loc.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+                loc = Path.ChangeExtension(loc, ".exe");
+            return loc;
+        }
 
-                if (enable)
+        /// <summary>
+        /// Runs schtasks and reports whether it actually succeeded.
+        ///
+        /// UseShellExecute is false deliberately: app.manifest declares requireAdministrator, so this
+        /// process is already elevated and its child inherits that token - no re-elevation, and more
+        /// importantly we can read the exit code and the error text. The previous version launched it
+        /// through the shell and checked neither, so a failed task creation was completely invisible.
+        /// </summary>
+        private static bool RunSchtasks(string args, out string output)
+        {
+            output = string.Empty;
+            try
+            {
+                var psi = new ProcessStartInfo("schtasks", args)
                 {
-                    
-                    
-                    string args = $"/create /tn \"{taskName}\" /tr \"\\\"{exePath}\\\" -apply -minimize\" /sc onlogon /rl highest /f";
-                    
-                    ProcessStartInfo psi = new ProcessStartInfo("schtasks", args)
-                    {
-                        CreateNoWindow = true,
-                        UseShellExecute = true,
-                        Verb = "runas", 
-                        WindowStyle = ProcessWindowStyle.Hidden
-                    };
-                    Process.Start(psi);
-                }
-                else
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using (var proc = Process.Start(psi))
                 {
-                    
-                    string args = $"/delete /tn \"{taskName}\" /f";
-                    ProcessStartInfo psi = new ProcessStartInfo("schtasks", args)
-                    {
-                        CreateNoWindow = true,
-                        UseShellExecute = true,
-                        Verb = "runas",
-                        WindowStyle = ProcessWindowStyle.Hidden
-                    };
-                    Process.Start(psi);
+                    if (proc == null) return false;
+                    // schtasks emits only a line or two, so reading sequentially cannot fill the pipe.
+                    output = proc.StandardOutput.ReadToEnd() + proc.StandardError.ReadToEnd();
+                    if (!proc.WaitForExit(15000)) return false;
+                    return proc.ExitCode == 0;
                 }
             }
             catch (Exception ex)
             {
-                
-                if (!(ex is System.ComponentModel.Win32Exception))
+                output = ex.Message;
+                return false;
+            }
+        }
+
+        private static bool AutostartTaskExists()
+        {
+            string ignored;
+            return RunSchtasks("/query /tn \"" + AutostartTaskName + "\"", out ignored);
+        }
+
+        /// <summary>Creates or removes the autostart task. Returns true only on real success.</summary>
+        private bool SetAutostart(bool enable)
+        {
+            // Legacy Run-key entry from older versions: always cleared, the scheduled task replaced it
+            // (a Run entry would trigger a UAC prompt at every logon for a requireAdministrator app).
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(
+                           @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true))
                 {
-                    MessageBox.Show("Error managing autostart task: " + ex.Message);
+                    key?.DeleteValue("DwmLutGUI", false);
                 }
             }
+            catch { }
+
+            string output;
+
+            if (!enable)
+            {
+                if (!AutostartTaskExists()) return true;   // nothing to undo
+
+                if (RunSchtasks("/delete /tn \"" + AutostartTaskName + "\" /f", out output))
+                {
+                    GuiDiag.Log("[autostart] existing task removed");
+                    return true;
+                }
+
+                GuiDiag.Log("[autostart] failed to remove task: " + output.Trim());
+                MessageBox.Show(
+                    "DwmLut is already registered to start with Windows and that entry could not be " +
+                    "removed:\n\n" + output.Trim(),
+                    "Autostart", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+
+            var action = "\"\\\"" + GetExecutablePath() + "\\\" -apply -minimize\"";
+            var user = WindowsIdentity.GetCurrent().Name;
+            var head = "/create /tn \"" + AutostartTaskName + "\" /tr " + action + " /sc onlogon";
+
+            // Most specific first, each fallback dropping a switch an older schtasks might reject, so
+            // this can never end up worse than the original command.
+            //   /ru + /it : bind the trigger to this user and use their interactive token, so no stored
+            //               password is needed (and no hidden password prompt can hang us)
+            //   /delay    : logon fires before the display topology has settled; -apply straight away
+            //               can run against monitors that are not enumerated yet
+            var candidates = new[]
+            {
+                head + " /ru \"" + user + "\" /it /rl highest /delay 0000:15 /f",
+                head + " /ru \"" + user + "\" /it /rl highest /f",
+                head + " /rl highest /f"
+            };
+
+            var lastOutput = string.Empty;
+            for (var i = 0; i < candidates.Length; i++)
+            {
+                if (RunSchtasks(candidates[i], out output))
+                {
+                    GuiDiag.Log("[autostart] task created (variant " + (i + 1) + " of " + candidates.Length + ")");
+                    return true;
+                }
+                lastOutput = output;
+                GuiDiag.Log("[autostart] variant " + (i + 1) + " failed: " + output.Trim());
+            }
+
+            MessageBox.Show(
+                "Autostart could not be enabled:\n\n" + lastOutput.Trim() +
+                "\n\nYou will be asked again next time DwmLut starts.",
+                "Autostart", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
         }
 
         private void UpdateContextMenu()
@@ -484,13 +700,26 @@ namespace DwmLutGUI
                     "This display is currently in SDR mode.\n\nAn HDR LUT is only applied while the display is in HDR mode, so it will have no effect right now. Assign an SDR LUT for SDR mode, or enable HDR for this display in Windows display settings.",
                     "LUT / display-mode mismatch", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             else if (!isHdrLut && m.IsHdr)
-                MessageBox.Show(
-                    "This display is currently in HDR mode.\n\nAn SDR LUT is only applied while the display is in SDR mode, so it will have no effect right now. Assign an HDR LUT for HDR mode, or disable HDR for this display in Windows display settings.",
-                    "LUT / display-mode mismatch", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            {
+                // WCG is not HDR, but Windows composites it into the same FP16 surface, and the
+                // injector picks the LUT slot from that surface format - so the HDR slot is what
+                // actually applies. The plain HDR wording is wrong here: it would tell the user to
+                // disable an HDR mode this display does not have.
+                if (m.ColorMode == AdvancedColorMode.Wcg)
+                    MessageBox.Show(
+                        "This display is in WCG (advanced color) mode.\n\nWCG is not HDR, but Windows composites it into the same FP16 (scRGB) surface that HDR uses, and the LUT is chosen from that surface format - so the HDR LUT slot is the one that applies here and this SDR LUT will have no effect.\n\nAssign an HDR LUT for this display, or turn off \"Automatically manage color for apps\" in Windows display settings to put it back into plain SDR.",
+                        "LUT / display-mode mismatch", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                else
+                    MessageBox.Show(
+                        "This display is currently in HDR mode.\n\nAn SDR LUT is only applied while the display is in SDR mode, so it will have no effect right now. Assign an HDR LUT for HDR mode, or disable HDR for this display in Windows display settings.",
+                        "LUT / display-mode mismatch", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
 
         private void Disable_Click(object sender, RoutedEventArgs e)
         {
+            if (_viewModel != null && _viewModel.IsBusy) return;
+
             try
             {
                 _viewModel.Uninject();
@@ -506,6 +735,7 @@ namespace DwmLutGUI
         private void Apply_Click(object sender, RoutedEventArgs e)
         {
             if (_applyOnCooldown) return;
+            if (_viewModel != null && _viewModel.IsBusy) return;
             _applyOnCooldown = true;
 
             ApplyDiag.Mark();
