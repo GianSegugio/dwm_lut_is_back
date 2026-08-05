@@ -521,8 +521,40 @@ namespace DwmLutGUI
 
             if (!copied)
             {
-                // Fallback to try copying one last time, let it throw the real error if it fails
-                File.Copy(AppDomain.CurrentDomain.BaseDirectory + DllName, DllPath, true);
+                // The previous instance is still mapped into dwm.exe, so the file is locked. That is
+                // routine during a display change, where uninject and re-inject happen back to back -
+                // and it must not take the app down, which is what letting the copy throw did.
+                //
+                // If what is already staged is byte-identical to what we would have written, it is the
+                // same build and injecting it is exactly what we were about to do anyway.
+                var src = new FileInfo(AppDomain.CurrentDomain.BaseDirectory + DllName);
+                var dst = new FileInfo(DllPath);
+
+                if (dst.Exists && src.Exists &&
+                    dst.Length == src.Length && dst.LastWriteTimeUtc == src.LastWriteTimeUtc)
+                {
+                    GuiDiag.Log("[stage] dwm_lut.dll still in use; staged copy is identical, reusing it");
+                }
+                else
+                {
+                    // Genuinely different builds: retry a while longer before giving up, since the
+                    // lock is transient and injecting a stale DLL would be worse than waiting.
+                    for (var attempt = 0; attempt < 40 && !copied; attempt++)
+                    {
+                        try
+                        {
+                            File.Copy(AppDomain.CurrentDomain.BaseDirectory + DllName, DllPath, true);
+                            copied = true;
+                        }
+                        catch (IOException) { System.Threading.Thread.Sleep(50); }
+                    }
+
+                    if (!copied)
+                    {
+                        GuiDiag.Log("[stage] could not replace dwm_lut.dll - still locked by dwm.exe");
+                        return;   // skip this injection; the next display change will retry
+                    }
+                }
             }
 
             ClearPermissions(DllPath);

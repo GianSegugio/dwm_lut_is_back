@@ -125,11 +125,16 @@ static void diag_log(const char* msg)
 #if !DIAG_MONITOR_MATCH
 	return;   // logging disabled in production; set DIAG_MONITOR_MATCH=1 to enable dwm_diag.log
 #endif
+	// Milliseconds since this DLL attached. Ordering alone cannot tell us how our idle threshold
+	// compares with DWM's own erase deadline - that needs elapsed time, especially under power
+	// saving where compositing slows down and wall-clock and frame-count diverge sharply.
+	static const unsigned long long s_epoch = GetTickCount64();
+
 	__try
 	{
 		FILE* f = fopen(R"(C:\Windows\Temp\dwm_diag.log)", "a");
 		if (!f) return;
-		fprintf(f, "%s\n", msg);
+		fprintf(f, "[%6llums] %s\n", GetTickCount64() - s_epoch, msg);
 		fclose(f);
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -211,11 +216,6 @@ static bool ResourceOnDevice(ID3D11DeviceChild* res, ID3D11Device* dev)
 	return d.Get() == dev;
 }
 
-struct RtvCacheEntry {
-	ID3D11Texture2D* texture;
-	ID3D11RenderTargetView* rtv;
-};
-
 // Immutable, per DEVICE INSTANCE (resources are bound to the instance, so the instance is the
 // correct key; LUID is recorded for diagnostics). Built ONCE on the worker thread.
 struct AdapterAssets {
@@ -249,6 +249,24 @@ struct OutputRes {
 	int lastLutSize[2] = {-1, -1};
 	int sightings = 0;                            // transient-plane debounce
 	std::atomic<bool> ready{false};
+
+	// Identity of the layout these caches were built for. A COverlayContext pointer is NOT identity:
+	// DWM keeps using it across a display topology change, and the same pointer has been observed
+	// coming back describing a different monitor origin (an external moved -661 -> -567 when a third
+	// display was unplugged). Each cached RTV also holds a strong reference to its backbuffer, so
+	// entries kept across a re-layout pin dead DWM surfaces - and through them the device - alive,
+	// which is exactly what makes CD3DDevice's final Release return non-zero and trip its leak
+	// checker. Tracked so the cache can be dropped the moment the layout moves.
+	bool layoutKnown = false;                     // explicit flag: avoids a sentinel value entirely
+	int  layoutLeft = 0, layoutTop = 0;
+	UINT layoutWidth = 0, layoutHeight = 0;
+
+	// Releases the cached render targets, and with them the backbuffers they pin.
+	void DropRtvCache()
+	{
+		for (int i = 0; i < rtvCount; i++) { rtvCache[i].rtv.Reset(); rtvCache[i].key = nullptr; }
+		rtvCount = 0;
+	}
 };
 
 static std::map<ID3D11Device*, AdapterAssets*> g_adapters;
@@ -256,6 +274,15 @@ static std::mutex g_adaptersMutex;
 static std::map<void* /*self*/, OutputRes*> g_outputs;
 static std::mutex g_outputsMutex;
 
+// Idle sweeping is only worth doing around a display topology change - that is the only time DWM
+// tears a device down. Running it every frame regardless produced 16 asset rebuilds for a single real
+// erase: a monitor showing static content stops presenting, so its adapter looks "idle" while being
+// perfectly alive, and gets dropped and rebuilt over and over.
+//
+// This marks the window in which a teardown is plausible. It is opened by anything that indicates the
+// display configuration is in motion: DLL attach (the GUI re-injects on every display change, so an
+// injection IS a topology signal), an output whose geometry moved, a change in DWM's device count, or
+// a device flagged lost. Outside that window the sweep does not run at all.
 #if DEBUG_MODE == true
 void print_error(const char* prefix_message)
 {
@@ -391,7 +418,15 @@ struct DwmSignatures
 	unsigned char present[DWM_SIG_MAX];           size_t presentLen;
 	unsigned char overlaysEnabled[DWM_SIG_MAX];   size_t overlaysEnabledLen;
 	unsigned char isCandidateDf[DWM_SIG_MAX];     size_t isCandidateDfLen;
-	unsigned char processDeviceLost[DWM_SIG_MAX]; size_t processDeviceLostLen; // for the device-lost hook
+	// RETAINED BUT UNUSED. ProcessDeviceLost is no longer hooked: its entry is too early to see the
+	// lost flags (DWM sets them inside its own body), and the erase hook covers every removal anyway.
+	// Kept only so the function stays identifiable if a future build ever needs it again.
+	unsigned char processDeviceLost[DWM_SIG_MAX]; size_t processDeviceLostLen;
+	// CDeviceManager::DeleteUnusedDevices - the eraser itself. ProcessDeviceLost sets the lost flags
+	// during its own body, so a check at ITS entry always sees a clean vector; by the time this is
+	// entered the flags are live and the devices have not been erased yet. This is the only point
+	// where releasing is both necessary and still possible.
+	unsigned char deleteUnusedDevices[DWM_SIG_MAX]; size_t deleteUnusedDevicesLen;
 };
 
 struct DwmProfile
@@ -399,13 +434,20 @@ struct DwmProfile
 	unsigned long long minVersion;                     // applies when dwmcore version >= this
 	DwmSignatures sigs;                                // AOB signatures (embedded by value)
 	int clipBoxOffset;                                 // per-monitor desktop origin (float RECT)
-	// Device-lost gating: read DWM's internal device vector (CDeviceManager) to release our resources
-	// ONLY when a device is actually flagged for deletion, so the every-frame ProcessDeviceLost hook
-	// doesn't rebuild resources every frame. All are dwmcore-build-specific.
+	// DWM's internal device vector (CDeviceManager). Read by the diagnostic build to report device
+	// state; the release itself is driven by the erase hook. All are dwmcore-build-specific.
 	unsigned int deviceVecFirstRva;   // .data addr of the device vector's _Myfirst (begin) pointer
 	unsigned int deviceVecLastRva;    // .data addr of the device vector's _Mylast (end) pointer
 	int deviceInfoStride;             // bytes per DeviceInfo element in that vector
 	int deviceLostFlagOffset;         // offset in the device object; nonzero => flagged lost/about-to-erase
+	int deviceRefCountOffset;         // CD3DDevice refcount; DWM's idle-erase path fires when it hits 1
+	// Byte offset, inside CDeviceManager::DeleteUnusedDevices, of the `call rel32` to
+	// std::vector<DeviceInfo>::erase. That erase is the ONLY path by which a device is removed, so
+	// hooking it is what guarantees we release before DWM's final Release runs. The AOB signature only
+	// covers the function's first 38 bytes and therefore cannot validate this call site - keeping the
+	// offset here means a future build that moves it needs one number changed, not new code. A
+	// mismatch is caught at runtime (the byte must be 0xE8) and logged, so it fails safe.
+	int eraseCallOffset;
 	// Fullscreen-overlay suppression: on this build, hook COverlayContext::OverlaysEnabled (forcing it
 	// false for LUT contexts) to keep the LUT applied over fullscreen apps. It is installed via the
 	// register-preserving asm thunk (OverlaysEnabled_thunk), because DWM's IsDFlipOnMPO relies on r8
@@ -444,8 +486,12 @@ static const DwmProfile g_dwmProfiles[] = {
 			// CDeviceManager::ProcessDeviceLost (prologue ends in a build-specific lea rcx,[rip+rel32], wildcarded)
 			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x48, 0x08, 0x56,
 			  0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x40, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0x0D, '?', '?', '?', '?' }, 33,
+			// CDeviceManager::DeleteUnusedDevices (identical prologue on 8246/8655/8875/8935)
+			{ 0x48, 0x89, 0x4C, 0x24, 0x08, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8D, 0x0D,
+			  '?', '?', '?', '?', 0x48, 0xFF, 0x15, '?', '?', '?', '?', 0x0F, 0x1F, 0x44, 0x00, 0x00,
+			  0x4C, 0x8B, 0x05, '?', '?', '?', '?', 0x32, 0xDB }, 38,
 		},
-		0x7648, 0x3FAD38, 0x3FAD40, 0x10, 0x458,  // clipBox, vecFirst, vecLast, stride, flag
+		0x7648, 0x3FAD38, 0x3FAD40, 0x10, 0x458, 0x08, 0x47,  // clipBox, vecFirst, vecLast, stride, flag, refcnt, eraseCall
 		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
 	},
 
@@ -465,8 +511,12 @@ static const DwmProfile g_dwmProfiles[] = {
 			// CDeviceManager::ProcessDeviceLost (prologue ends in a build-specific lea rcx,[rip+rel32], wildcarded)
 			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x48, 0x08, 0x56,
 			  0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x40, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0x0D, '?', '?', '?', '?' }, 33,
+			// CDeviceManager::DeleteUnusedDevices (identical prologue on 8246/8655/8875/8935)
+			{ 0x48, 0x89, 0x4C, 0x24, 0x08, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8D, 0x0D,
+			  '?', '?', '?', '?', 0x48, 0xFF, 0x15, '?', '?', '?', '?', 0x0F, 0x1F, 0x44, 0x00, 0x00,
+			  0x4C, 0x8B, 0x05, '?', '?', '?', '?', 0x32, 0xDB }, 38,
 		},
-		0x7658, 0x3FCC98, 0x3FCCA0, 0x10, 0x458,  // clipBox, vecFirst, vecLast, stride, flag
+		0x7658, 0x3FCC98, 0x3FCCA0, 0x10, 0x458, 0x08, 0x47,  // clipBox, vecFirst, vecLast, stride, flag, refcnt, eraseCall
 		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
 	},
 
@@ -486,8 +536,12 @@ static const DwmProfile g_dwmProfiles[] = {
 			// CDeviceManager::ProcessDeviceLost (prologue ends in a build-specific lea rcx,[rip+rel32], wildcarded)
 			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x48, 0x08, 0x56,
 			  0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x40, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0x0D, '?', '?', '?', '?' }, 33,
+			// CDeviceManager::DeleteUnusedDevices (identical prologue on 8246/8655/8875/8935)
+			{ 0x48, 0x89, 0x4C, 0x24, 0x08, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8D, 0x0D,
+			  '?', '?', '?', '?', 0x48, 0xFF, 0x15, '?', '?', '?', '?', 0x0F, 0x1F, 0x44, 0x00, 0x00,
+			  0x4C, 0x8B, 0x05, '?', '?', '?', '?', 0x32, 0xDB }, 38,
 		},
-		0x7658, 0x3FAB78, 0x3FAB80, 0x10, 0x458,  // clipBox, vecFirst, vecLast, stride, flag
+		0x7658, 0x3FAB78, 0x3FAB80, 0x10, 0x458, 0x08, 0x47,  // clipBox, vecFirst, vecLast, stride, flag, refcnt, eraseCall
 		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
 	},
 
@@ -507,8 +561,12 @@ static const DwmProfile g_dwmProfiles[] = {
 			// CDeviceManager::ProcessDeviceLost (prologue ends in a build-specific lea rcx,[rip+rel32], wildcarded)
 			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x48, 0x08, 0x56,
 			  0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x40, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0x0D, '?', '?', '?', '?' }, 33,
+			// CDeviceManager::DeleteUnusedDevices (identical prologue on 8246/8655/8875/8935)
+			{ 0x48, 0x89, 0x4C, 0x24, 0x08, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8D, 0x0D,
+			  '?', '?', '?', '?', 0x48, 0xFF, 0x15, '?', '?', '?', '?', 0x0F, 0x1F, 0x44, 0x00, 0x00,
+			  0x4C, 0x8B, 0x05, '?', '?', '?', '?', 0x32, 0xDB }, 38,
 		},
-		0x7658, 0x3FDA88, 0x3FDA90, 0x10, 0x458,  // clipBox, vecFirst, vecLast, stride, flag
+		0x7658, 0x3FDA88, 0x3FDA90, 0x10, 0x458, 0x08, 0x47,  // clipBox, vecFirst, vecLast, stride, flag, refcnt, eraseCall
 		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
 	},
 };
@@ -536,6 +594,30 @@ bool isWindows11_25h2 = false;
 unsigned long long g_dwmcoreVersion = 0; // (build<<32)|revision of the loaded dwmcore.dll
 
 static int* g_pOverlayTestMode = NULL;
+
+// DWM's own OverlayTestMode value, captured before our first write. Detach used to hardcode 0 on the
+// way out, which is not necessarily what DWM had: 0 is merely the common default, so a non-default
+// value set by DWM (or by another tool) was silently discarded. Saved once, restored verbatim.
+static int  g_overlayTestModeOriginal = 0;
+static std::atomic<bool> g_overlayTestModeSaved{false};
+
+// Force MPO off so DWM composites (which is what lets the LUT apply at all), remembering the value we
+// found the first time round.
+static void ForceOverlayTestMode()
+{
+	if (g_pOverlayTestMode == NULL) return;
+	bool expected = false;
+	if (g_overlayTestModeSaved.compare_exchange_strong(expected, true))
+		g_overlayTestModeOriginal = *g_pOverlayTestMode;
+	*g_pOverlayTestMode = 5;
+}
+
+// Put back exactly what DWM had. A no-op if we never wrote it, so we can never invent a value.
+static void RestoreOverlayTestMode()
+{
+	if (g_pOverlayTestMode == NULL || !g_overlayTestModeSaved.load()) return;
+	*g_pOverlayTestMode = g_overlayTestModeOriginal;
+}
 
 bool aob_match_inverse(const void* buf1, const void* mask, const int buf_len)
 {
@@ -921,7 +1003,8 @@ static bool ClaimPosition(int left, int top, void* ctx)
 	return it->second == ctx;
 }
 
-lutData* GetLUTDataFromCOverlayContext(void* context, bool hdr, int* out_index)
+lutData* GetLUTDataFromCOverlayContext(void* context, bool hdr, int* out_index,
+                                       int* out_left, int* out_top)
 {
 	if (out_index) *out_index = -1;
 	if (!context) return NULL;
@@ -934,8 +1017,7 @@ lutData* GetLUTDataFromCOverlayContext(void* context, bool hdr, int* out_index)
 	if (dbgNew) DiagScanContextRects(context);
 #endif
 
-	if (g_pOverlayTestMode != NULL)
-		*g_pOverlayTestMode = 5;
+	ForceOverlayTestMode();
 
 	// Resolve the monitor's desktop origin. The DeviceClipBox location and interpretation differ per
 	// Windows build, so each branch reads a different offset via the SEH-guarded ReadRect (returns false
@@ -1027,6 +1109,8 @@ lutData* GetLUTDataFromCOverlayContext(void* context, bool hdr, int* out_index)
 			if (dbgNew) { char b[176]; snprintf(b, sizeof(b), "[ctx %p] origin=(%d,%d) hdr=%d -> MATCHED LUT #%d", context, left, top, (int)hdr, i); diag_log(b); }
 #endif
 			if (out_index) *out_index = i;
+			if (out_left)  *out_left  = left;
+			if (out_top)   *out_top   = top;
 			return &luts[i];
 		}
 
@@ -1183,7 +1267,7 @@ static AdapterAssets* FindOrRequestAdapter(ID3D11Device* dev)
 	// treat "a different device appeared" as a device swap and evict the others -- doing that caused a
 	// per-frame evict/rebuild thrash as compositing alternated between adapters (huge wasted shader/
 	// texture rebuilds -> stutter, and dropped LUTs on the adapter not being serviced that frame).
-	// Genuine device teardown is handled separately by the ProcessDeviceLost hook (EvictAllAssets on
+	// Genuine device teardown is handled separately by the vector<DeviceInfo>::erase hook (EvictAllAssets on
 	// DWM's own device-lost flag), which is the only correct signal that a device is actually going away.
 	AdapterAssets* a = new AdapterAssets();
 	GetDeviceLuidKey(dev, &a->luidKey);
@@ -1239,6 +1323,44 @@ void UninitializeStuff()
 	}
 }
 
+// Drops every reference this draw leaves on DWM's immediate context.
+//
+// The context AddRefs whatever is bound to it, and in D3D11 every child object keeps its device
+// alive. So releasing our own ComPtrs is NOT enough: while our RTV / SRVs / shaders / samplers stay
+// bound, they hold our resources alive, and those hold DWM's ID3D11Device alive.
+//
+// That matters because CD3DDevice's CD3DResourceLeakChecker destructor performs the final Release on
+// the device and breaks into the debugger if the returned refcount is not zero. Any straggling
+// reference - ours or one the context is holding on our behalf - turns a device teardown into a
+// dwm.exe crash (seen as ProcessDeviceLost -> DeleteUnusedDevices -> ~CD3DResourceLeakChecker).
+//
+// Unbinding at the source means a teardown is safe even when EvictAllAssets cannot run: while the
+// device-lost hook is uninstalled during detach, or between apply cycles. DWM re-binds all of this
+// state for its own draws anyway - we already clobber it - so nulling the slots costs nothing.
+struct ContextBindingGuard
+{
+	ID3D11DeviceContext* ctx;
+	explicit ContextBindingGuard(ID3D11DeviceContext* c) : ctx(c) {}
+	~ContextBindingGuard()
+	{
+		if (ctx == NULL) return;
+		ID3D11RenderTargetView*   nullRtv[1] = { NULL };
+		ID3D11ShaderResourceView* nullSrv[3] = { NULL, NULL, NULL };
+		ID3D11SamplerState*       nullSmp[2] = { NULL, NULL };
+		ID3D11Buffer*             nullBuf[1] = { NULL };
+		UINT zeroStride[1] = { 0 }, zeroOffset[1] = { 0 };
+
+		ctx->OMSetRenderTargets(1, nullRtv, NULL);
+		ctx->PSSetShaderResources(0, 3, nullSrv);
+		ctx->PSSetSamplers(0, 2, nullSmp);
+		ctx->PSSetConstantBuffers(0, 1, nullBuf);
+		ctx->IASetVertexBuffers(0, 1, nullBuf, zeroStride, zeroOffset);
+		ctx->IASetInputLayout(NULL);
+		ctx->VSSetShader(NULL, NULL, 0);
+		ctx->PSSetShader(NULL, NULL, 0);
+	}
+};
+
 bool RenderLUT(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects,
                AdapterAssets* a, ID3D11Device* dev)
 {
@@ -1260,7 +1382,9 @@ bool RenderLUT(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, i
 	if (index == -1) return false;
 
 	int lutIdx = 0; lutData* lut;
-	if (!(lut = GetLUTDataFromCOverlayContext(self, index == 1, &lutIdx))) return false;
+	int lutLeft = 0, lutTop = 0;   // always written when the lookup succeeds
+	if (!(lut = GetLUTDataFromCOverlayContext(self, index == 1, &lutIdx, &lutLeft, &lutTop))) return false;
+
 	if (lutIdx < 0 || lutIdx >= a->lutCount) return false;
 	ID3D11ShaderResourceView* lutSrv = a->lutSrv[lutIdx].Get();
 	if (!lutSrv || !ResourceOnDevice(lutSrv, dev)) return false; // explicit: LUT texture belongs to this device
@@ -1275,7 +1399,25 @@ bool RenderLUT(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, i
 	    !o->vertexBuffer || !o->constantBuffer) return false;
 	if (!ResourceOnDevice(o->scratch[index].Get(), dev)) return false;
 
-	// RTV cache (tiny view objects; cached per backbuffer, evict-oldest). Not the leak source.
+	// The scratch texture is revalidated upstream against the current surface, but the render-target
+	// cache is keyed purely on a backbuffer pointer and survives a re-layout, pinning the old
+	// surfaces. Drop it whenever this output's geometry moves or resizes; the lookup below then
+	// builds a fresh RTV for the current backbuffer.
+	if (!o->layoutKnown || o->layoutLeft != lutLeft || o->layoutTop != lutTop ||
+	    o->layoutWidth != bbDesc.Width || o->layoutHeight != bbDesc.Height)
+	{
+		const bool firstSight = !o->layoutKnown;
+		o->layoutKnown = true;
+		o->layoutLeft = lutLeft;  o->layoutTop = lutTop;
+		o->layoutWidth = bbDesc.Width; o->layoutHeight = bbDesc.Height;
+		if (!firstSight)
+		{
+			o->DropRtvCache();
+			diag_log("output layout changed -> released cached render targets");
+		}
+	}
+
+	// RTV cache (tiny view objects; cached per backbuffer, evict-oldest).
 	ID3D11RenderTargetView* rtv = nullptr;
 	for (int i = 0; i < o->rtvCount; i++)
 		if (o->rtvCache[i].key == backBuffer) { rtv = o->rtvCache[i].rtv.Get(); break; }
@@ -1295,6 +1437,10 @@ bool RenderLUT(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, i
 	}
 
 	ID3D11DeviceContext* ctx = a->context.Get();
+
+	// Armed before the first bind so it also covers the mid-function Map() failure returns.
+	ContextBindingGuard unbindOnExit(ctx);
+
 	const D3D11_VIEWPORT vp(0, 0, (float)bbDesc.Width, (float)bbDesc.Height, 0.0f, 1.0f);
 	ctx->RSSetViewports(1, &vp);
 	ctx->OMSetRenderTargets(1, &rtv, NULL);
@@ -1390,6 +1536,38 @@ static bool SafeGetDeviceFromSwapChain(IDXGISwapChain* sc, ID3D11Device** outDev
 	}
 }
 
+// Maps a backbuffer format to the LUT slot it would use (0 = SDR, 1 = HDR), or -1 if unhandled.
+static int LutIndexForFormat(DXGI_FORMAT fmt)
+{
+	if (fmt == DXGI_FORMAT_B8G8R8A8_UNORM || fmt == DXGI_FORMAT_R8G8B8A8_UNORM ||
+	    fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+	    fmt == DXGI_FORMAT_R10G10B10A2_UNORM) return 0;
+	if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) return 1;
+	return -1;
+}
+
+// Whether this context actually has a LUT that would be applied, answered WITHOUT touching the
+// adapter.
+//
+// This gate exists because building adapter assets takes a strong ComPtr on DWM's ID3D11Device (and
+// every resource we create on it keeps that device alive too). CD3DDevice's leak checker performs
+// the final Release on teardown and breaks into the debugger unless the refcount comes back zero, so
+// any adapter we have touched cannot be destroyed cleanly.
+//
+// Previously assets were built for whatever device presented, LUT or not. Unplugging a display that
+// had NO LUT then crashed dwm.exe: we had built assets for its adapter anyway, and when that
+// adapter's last display went away DWM destroyed the device while we still held it. A display with
+// no applicable LUT must leave no footprint on its adapter at all.
+static bool ContextHasApplicableLut(void* self, ID3D11Texture2D* backBuffer)
+{
+	if (!backBuffer) return false;
+	D3D11_TEXTURE2D_DESC d;
+	backBuffer->GetDesc(&d);
+	const int index = LutIndexForFormat(d.Format);
+	if (index < 0) return false;
+	return GetLUTDataFromCOverlayContext(self, index == 1, NULL, NULL, NULL) != NULL;
+}
+
 bool ApplyLUT(void* self, IDXGISwapChain* swapChain, struct tagRECT* rects, int numRects)
 {
 	if (g_hookInert.load() || !swapChain) return false;
@@ -1400,11 +1578,14 @@ bool ApplyLUT(void* self, IDXGISwapChain* swapChain, struct tagRECT* rects, int 
 	ComPtr<ID3D11Device> dev;
 	dev.Attach(devRaw); // take ownership of the ref GetDevice added
 
-	AdapterAssets* a = FindOrRequestAdapter(dev.Get());
-	if (!a) return false; // adapter assets unavailable (build failed) -> skip cleanly
-
 	ComPtr<ID3D11Texture2D> backBuffer;
 	if (FAILED(swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer))) || !backBuffer) return false;
+
+	// Gate before the adapter is touched: no LUT here means no reference on this device.
+	if (!ContextHasApplicableLut(self, backBuffer.Get())) return false;
+
+	AdapterAssets* a = FindOrRequestAdapter(dev.Get());
+	if (!a) return false; // adapter assets unavailable (build failed) -> skip cleanly
 
 	bool result = RenderLUT_Guarded(self, backBuffer.Get(), rects, numRects, a, dev.Get());
 	return result;
@@ -1416,6 +1597,9 @@ bool ApplyLUTDirect(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rec
 	ComPtr<ID3D11Device> dev;
 	backBuffer->GetDevice(&dev);
 	if (!dev) return false;
+
+	// Gate before the adapter is touched: no LUT here means no reference on this device.
+	if (!ContextHasApplicableLut(self, backBuffer)) return false;
 
 	AdapterAssets* a = FindOrRequestAdapter(dev.Get());
 	if (!a) return false;
@@ -1753,33 +1937,62 @@ extern "C" bool COverlayContext_OverlaysEnabled_hook(void* self)
 }
 
 // Device-lost hook: release our resources on any lost device before DWM destroys it.
-typedef void (CDeviceManager_ProcessDeviceLost_t)(void*);
-CDeviceManager_ProcessDeviceLost_t* CDeviceManager_ProcessDeviceLost_orig = NULL;
-
-// True if DWM has a device flagged lost (about to be erased). We read DWM's internal device vector
-// exactly as CDeviceManager::ProcessDeviceLost does. SEH-guarded: a torn/racy read just returns false.
-static bool AnyDwmDeviceLost()
+#if DIAG_MONITOR_MATCH
+// DIAGNOSTIC ONLY. Walks DWM's device vector under DWM's own lock; in a release build that would be a
+// critical-section acquisition on the composition thread every single frame, for a signal the erase
+// hook already acts on. Compiled out entirely unless DIAG_MONITOR_MATCH.
+//
+// Reports how many devices DWM currently tracks and how many are flagged lost. Same walk as
+// CDeviceManager::DeleteUnusedDevices performs. SEH-guarded: a torn/racy read reports nothing.
+static void DwmDeviceVectorState(int* outCount, int* outFlagged, int* outUnused)
 {
-	if (g_dwmDeviceVecFirst == NULL || g_dwmDeviceVecLast == NULL || g_activeDwmProfile == NULL) return false;
+	if (outCount) *outCount = -1;
+	if (outFlagged) *outFlagged = 0;
+	if (outUnused) *outUnused = 0;
+	if (g_dwmDeviceVecFirst == NULL || g_dwmDeviceVecLast == NULL || g_activeDwmProfile == NULL) return;
 	const int stride  = g_activeDwmProfile->deviceInfoStride;
 	const int flagOff = g_activeDwmProfile->deviceLostFlagOffset;
-	if (stride <= 0) return false;
+	const int refOff  = g_activeDwmProfile->deviceRefCountOffset;
+	if (stride <= 0) return;
+	int count = 0, flagged = 0, unused = 0;
 	__try
 	{
 		unsigned char* it  = *(unsigned char**)g_dwmDeviceVecFirst;
 		unsigned char* end = *(unsigned char**)g_dwmDeviceVecLast;
 		for (int guard = 0; it != NULL && it < end && guard < 256; it += stride, guard++)
 		{
-			unsigned char* dev = *(unsigned char**)it;             // DeviceInfo.device at +0
-			if (dev != NULL && *(volatile int*)(dev + flagOff) != 0) return true;
+			unsigned char* dev = *(unsigned char**)it;
+			count++;
+			if (dev == NULL) continue;
+			if (*(volatile int*)(dev + flagOff) != 0) flagged++;
+			// CD3DDevice refcount. DWM's idle erase path fires when this reaches 1 (only the device
+			// manager still holds it), so it is the earliest state-based signal that a device is
+			// about to go - unlike a wall-clock idle guess, it cannot drift with the frame rate.
+			if (*(volatile int*)(dev + refOff) <= 1) unused++;
 		}
 	}
-	__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-	return false;
+	__except (EXCEPTION_EXECUTE_HANDLER) { return; }
+	if (outCount) *outCount = count;
+	if (outFlagged) *outFlagged = flagged;
+	if (outUnused) *outUnused = unused;
 }
+#endif // DIAG_MONITOR_MATCH
 
 // Release ALL cached LUT assets on every tracked device. Called right before DWM erases a lost device
 // so its CD3DResourceLeakChecker finds nothing outstanding. Assets rebuild lazily next frame.
+// How long an adapter may sit unused before we drop our resources on it.
+//
+// DeleteUnusedDevices erases a device by EITHER of two tests: the lost flag, or - far more commonly -
+// an "idle" path (CD3DDevice refcount back to 1, no outstanding work, past a grace deadline). We
+// cannot usefully replicate the second: it depends on four more per-build struct offsets and a
+// deadline expressed in DWM's own composition units, which Microsoft can retune at will.
+//
+// So instead of predicting the erase we simply get out of the way first. DWM's grace period is
+// comfortably longer than a couple of seconds, and because asset building is asynchronous the cost of
+// being too eager is a frame or two without the LUT, never a stall - so erring short is the safe
+// direction. Note this only ticks while DWM is compositing, since that is when our hook runs.
+// Frames an adapter may go unrendered before we release it. Scales with the compositing rate by
+// construction: ~1 s at 60 fps, ~12 s at 5 fps - which is the same way DWM's deadline scales.
 static void EvictAllAssets()
 {
 	{
@@ -1804,15 +2017,100 @@ static void EvictAllAssets()
 	diag_log("dwm device-lost imminent -> released all LUT assets (rebuild after recovery)");
 }
 
-void CDeviceManager_ProcessDeviceLost_hook(void* self)
+// DWM guards its device vector with a CRITICAL_SECTION that DeleteUnusedDevices enters before it
+// scans. Reading the lost flags without it is a losing race: the flag is set by the thread handling
+// the display change, under this lock, and our unlocked check at function entry runs BEFORE DWM has
+// even taken it - which is why every diagnostic run reported "0 flagged lost" while a teardown was
+// in progress. Derived from the resolved function body rather than hardcoded per build:
+//   +0x0a  lea rcx, [rip + rel32]   <- the CRITICAL_SECTION
+//   +0x11  call EnterCriticalSection
+static CRITICAL_SECTION* g_dwmDeviceLock = NULL;
+
+// std::vector<CDeviceManager::DeviceInfo>::erase - reached ONLY when a device is actually being
+// removed, and it is the frame directly above CD3DDevice::Release in every crash stack we collected.
+//
+// This replaces guessing. Both previous attempts were proxies for "DWM is about to erase": a
+// wall-clock idle timer fired far too eagerly once compositing slowed down on battery, and a
+// composition-frame timer then fired too late for the same reason inverted. DWM's real predicate is
+// refcount + pending-work + a deadline whose struct offset moves between builds (0x5d0 / 0x740 /
+// 0x6d0), so replicating it is fragile too.
+//
+// Hooking the erase sidesteps all of it: at its entry the CD3DDevice is still alive and its Release
+// has not happened yet, so releasing here is always correctly timed - no threshold, no tuning, and no
+// sensitivity to power state.
+// THREE pointer arguments, not two. The prologue reads all of rcx, rdx and r8:
+//     mov r15,[rcx+8]     rcx = the vector
+//     lea rdi,[r8+0x10]   r8  = the position being erased
+//     mov r14,rdx         rdx = third operand
+// Declaring it with two arguments meant r8 was never forwarded, so the original dereferenced
+// whatever the detour happened to leave in that register - a wild pointer, which surfaced as a
+// c0000409 stack-cookie failure in dwmcore rather than anything resembling our bug. All three are
+// passed straight through; we only need the call as a timing signal, not its semantics.
+typedef void* (CDeviceManager_DeviceInfoErase_t)(void*, void*, void*);
+CDeviceManager_DeviceInfoErase_t* CDeviceManager_DeviceInfoErase_orig = NULL;
+
+void* CDeviceManager_DeviceInfoErase_hook(void* a1, void* a2, void* a3)
 {
-	// DWM calls this EVERY frame, so we must not release unconditionally (that would rebuild shaders/
-	// textures every frame). Release only when DWM is actually about to erase a device flagged lost --
-	// that's the moment our resources on it would trip the leak checker.
-	if (AnyDwmDeviceLost())
-		EvictAllAssets();
-	CDeviceManager_ProcessDeviceLost_orig(self);
+	diag_log("device entry being erased -> releasing all LUT assets first");
+	EvictAllAssets();
+	return CDeviceManager_DeviceInfoErase_orig(a1, a2, a3);
 }
+
+typedef void (CDeviceManager_DeleteUnusedDevices_t)(void*);
+CDeviceManager_DeleteUnusedDevices_t* CDeviceManager_DeleteUnusedDevices_orig = NULL;
+
+// The one place where releasing is both necessary and still possible.
+//
+// ProcessDeviceLost sets the per-device lost flags during its own body, so our check at ITS entry
+// always saw a clean vector and never evicted (confirmed: the "device-lost imminent" line never
+// appeared in any diagnostic log, across many hot-unplugs). DeleteUnusedDevices is called at the end
+// of ProcessDeviceLost, and it is the function that actually erases: at its entry the flags are live
+// and the CD3DDevice objects are still alive.
+//
+// That matters because CD3DDevice's leak checker performs the final Release on teardown and breaks
+// into the debugger unless the refcount returns zero. Anything of ours still on that device - the
+// adapter's ComPtr<ID3D11Device>, its shaders, LUT textures, or the per-output scratch and render
+// targets - makes it non-zero and turns an unplug into a dwm.exe crash. Releasing here happens
+// before the erase, so DWM's own Release is genuinely the last one.
+#if DIAG_MONITOR_MATCH
+void CDeviceManager_DeleteUnusedDevices_hook(void* self)
+{
+	// Sample under DWM's own lock so the flags are consistent. The eviction itself is done AFTER
+	// releasing it: releasing D3D objects while holding a DWM lock is asking for a lock-order
+	// inversion, and by then we already know we must drop everything.
+	int count = -1, flagged = 0, unused = 0;
+	if (g_dwmDeviceLock != NULL)
+	{
+		__try { EnterCriticalSection(g_dwmDeviceLock); }
+		__except (EXCEPTION_EXECUTE_HANDLER) { g_dwmDeviceLock = NULL; }
+	}
+	DwmDeviceVectorState(&count, &flagged, &unused);
+	if (g_dwmDeviceLock != NULL) LeaveCriticalSection(g_dwmDeviceLock);
+
+	// Runs every frame, so it is throttled - but it must report BOTH a change in the device set and
+	// any call where something is flagged, because those are different events and the flagged one is
+	// the only one we can act on. Note the count alone is not enough: this DLL is re-injected on every
+	// display change, so a per-instance "last count" only ever samples the first call of a session and
+	// can never witness a transition.
+	static int lastCount = -2, lastUnused = -1;
+	if (count != lastCount || flagged > 0 || unused != lastUnused)
+	{
+		const int prev = lastCount;
+		lastCount = count; lastUnused = unused;
+		char b[192];
+		snprintf(b, sizeof(b), "[devlost] DeleteUnusedDevices: %d device(s) (was %d), %d flagged, %d unused(refcnt<=1)%s",
+		         count, prev, flagged, unused, flagged > 0 ? "  <== EVICTING" : "");
+		diag_log(b);
+	}
+
+	// A flagged device is released here as an early opportunity; the guaranteed release happens in
+	// the vector<DeviceInfo>::erase hook, which sits on the only path by which a device is removed.
+	if (flagged > 0)
+		EvictAllAssets();
+
+	CDeviceManager_DeleteUnusedDevices_orig(self);
+}
+#endif // DIAG_MONITOR_MATCH
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 {
@@ -1980,17 +2278,33 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 						(COverlayContext_IsCandidateDirectFlipCompatible_24h2_t*)best;
 				}
 
-				// (c) CDeviceManager::ProcessDeviceLost - hooked to release our resources before DWM tears
-				// down a lost device (avoids its resource-leak-checker int 3 on fullscreen mode changes).
-				if (g_activeDwmProfile->sigs.processDeviceLost)
+				// (c2) CDeviceManager::DeleteUnusedDevices - where the lost flags are actually live.
+				if (g_activeDwmProfile->sigs.deleteUnusedDevices)
 				{
-					for (size_t i = 0; i + g_activeDwmProfile->sigs.processDeviceLostLen <= moduleInfo.SizeOfImage; i++)
+					for (size_t i = 0; i + g_activeDwmProfile->sigs.deleteUnusedDevicesLen <= moduleInfo.SizeOfImage; i++)
 					{
 						unsigned char* a = (unsigned char*)dwmcore + i;
-						if (!aob_match_inverse(a, g_activeDwmProfile->sigs.processDeviceLost,
-							(int)g_activeDwmProfile->sigs.processDeviceLostLen))
+						if (!aob_match_inverse(a, g_activeDwmProfile->sigs.deleteUnusedDevices,
+							(int)g_activeDwmProfile->sigs.deleteUnusedDevicesLen))
 						{
-							CDeviceManager_ProcessDeviceLost_orig = (CDeviceManager_ProcessDeviceLost_t*)a;
+							CDeviceManager_DeleteUnusedDevices_orig = (CDeviceManager_DeleteUnusedDevices_t*)a;
+							// lea rcx,[rip+rel32] at +0x0a -> the CRITICAL_SECTION guarding the
+							// device vector. The signature already pins these three opcodes.
+							if (a[0x0A] == 0x48 && a[0x0B] == 0x8D && a[0x0C] == 0x0D)
+							{
+								int rel = *(int*)(a + 0x0D);
+								g_dwmDeviceLock = (CRITICAL_SECTION*)(a + 0x11 + rel);
+							}
+							// call rel32 at +0x47 -> std::vector<DeviceInfo>::erase, the exact
+							// moment a device is removed. Derived from the body, so no per-build
+							// address is needed (the deadline offset this replaces is NOT stable).
+							const int ec = g_activeDwmProfile->eraseCallOffset;
+							if (ec > 0 && a[ec] == 0xE8)
+							{
+								int rel = *(int*)(a + ec + 1);
+								CDeviceManager_DeviceInfoErase_orig =
+									(CDeviceManager_DeviceInfoErase_t*)(a + ec + 5 + rel);
+							}
 							break;
 						}
 					}
@@ -2244,7 +2558,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				if (g_pOverlayTestMode != NULL)
 				{
-					*g_pOverlayTestMode = 5;
+					ForceOverlayTestMode();
 					LOG_ONLY_ONCE("SUCCESS: Forced OverlayTestMode to 5")
 				}
 				else {
@@ -2265,16 +2579,44 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 						MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)COverlayContext_OverlaysEnabled_hook,
 						              (PVOID*)&COverlayContext_OverlaysEnabled_orig);
 				}
-				if (CDeviceManager_ProcessDeviceLost_orig)
-					MH_CreateHook((PVOID)CDeviceManager_ProcessDeviceLost_orig, (PVOID)CDeviceManager_ProcessDeviceLost_hook,
-					              (PVOID*)&CDeviceManager_ProcessDeviceLost_orig);
+				if (CDeviceManager_DeleteUnusedDevices_orig)
+				{
+					// The load-bearing hook. vector<DeviceInfo>::erase is the ONLY path by which a
+					// device is removed, and at its entry the CD3DDevice is still alive - so releasing
+					// there is correctly timed by construction, with no threshold and no sensitivity to
+					// compositing rate. Its address is derived from the call at eraseCallOffset.
+					if (CDeviceManager_DeviceInfoErase_orig)
+					{
+						MH_CreateHook((PVOID)CDeviceManager_DeviceInfoErase_orig,
+						              (PVOID)CDeviceManager_DeviceInfoErase_hook,
+						              (PVOID*)&CDeviceManager_DeviceInfoErase_orig);
+						diag_log("hooked vector<DeviceInfo>::erase (exact device-removal point)");
+					}
+					else {
+						diag_log("FAILED to resolve vector<DeviceInfo>::erase - device teardown is UNPROTECTED");
+					}
+
+#if DIAG_MONITOR_MATCH
+					// Diagnostic only. This one samples DWM's device vector under DWM's own lock on
+					// every composited frame, which a release build has no reason to pay for: the
+					// erase hook above already does the actual work.
+					MH_CreateHook((PVOID)CDeviceManager_DeleteUnusedDevices_orig,
+					              (PVOID)CDeviceManager_DeleteUnusedDevices_hook,
+					              (PVOID*)&CDeviceManager_DeleteUnusedDevices_orig);
+					diag_log(g_dwmDeviceLock ? "hooked CDeviceManager::DeleteUnusedDevices (device lock resolved)"
+					                         : "hooked CDeviceManager::DeleteUnusedDevices (NO device lock - reads unlocked)");
+#endif
+				}
+				else {
+					diag_log("FAILED to find CDeviceManager::DeleteUnusedDevices (signature miss)");
+				}
 				MH_EnableHook(MH_ALL_HOOKS);
 				// (worker thread removed: adapter/output assets are now built synchronously and cached)
 				LOG_ONLY_ONCE("DWM HOOK DLL INITIALIZATION. START LOGGING")
 
 				if (g_pOverlayTestMode != NULL)
 				{
-					*g_pOverlayTestMode = 5;
+					ForceOverlayTestMode();
 					LOG_ONLY_ONCE("Set OverlayTestMode global to 5 in DWM memory")
 				}
 
@@ -2284,13 +2626,25 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			return FALSE;
 		}
 	case DLL_PROCESS_DETACH:
+		// Order matters here.
+		//
+		// g_hookInert makes every hook body return immediately (ApplyLUT / ApplyLUTDirect check it
+		// before touching anything), so after a short drain no hook can still be using our assets.
+		// Only then do we release - and crucially we do it while the hooks are STILL installed, so
+		// the device-lost hook stays available right up to the moment we own nothing.
+		//
+		// Releasing after MH_DisableHook, as this used to, left a ~150 ms window holding a strong
+		// reference to DWM's ID3D11Device with no hook able to evict it. CD3DDevice's leak checker
+		// performs the final Release and breaks into the debugger if the refcount is not zero, so a
+		// device teardown inside that window turns into a dwm.exe crash
+		// (ProcessDeviceLost -> DeleteUnusedDevices -> ~CD3DResourceLeakChecker).
 		g_hookInert.store(true);
-		if (g_pOverlayTestMode != NULL) *g_pOverlayTestMode = 0;
+		Sleep(50);                      // let hook bodies already in flight finish
+		UninitializeStuff();            // drop every D3D reference we hold, hooks still live
 		MH_DisableHook(MH_ALL_HOOKS);
-		Sleep(50);
+		Sleep(50);                      // let any detour in flight return before trampolines go away
 		MH_Uninitialize();
-		Sleep(100);
-		UninitializeStuff();
+		RestoreOverlayTestMode();       // last: nothing can force it back to 5 after this
 		break;
 	default:
 		break;

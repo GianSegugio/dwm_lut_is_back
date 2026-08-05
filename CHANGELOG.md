@@ -8,6 +8,50 @@ This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246**, **10.0.26
 ---
 ---
 
+## v1.2.2
+
+### Injector — device teardown no longer crashes DWM
+Connecting or disconnecting a monitor (and, less often, a fullscreen mode change) could crash `dwm.exe` in `CD3DResourceLeakChecker`. That checker performs the final `Release` on a device DWM is destroying and breaks into the debugger unless the refcount returns zero — so anything of ours still outstanding at that moment is fatal. In D3D11 every child object keeps its device alive, so this covers far more than the obvious device handle.
+
+Six separate defects contributed:
+
+- **Render state was never unbound.** The immediate context holds references to whatever is bound to it, so releasing our own handles left our render target, shaders, samplers and SRVs keeping the device alive. Every draw now unbinds on all exit paths.
+- **Detach released *after* unhooking.** `DLL_PROCESS_DETACH` removed the hooks first and released D3D references last, leaving a window holding a device reference with nothing able to evict it. The order is now: set the kill switch, drain in-flight hooks, release, then unhook.
+- **Assets were built for adapters with no applicable LUT.** Building them takes a strong reference to that adapter's device, so unplugging a display that had *no* LUT destroyed a device we had no business holding. The LUT is now resolved before the adapter is touched.
+- **The release was never correctly timed.** This was the hard one — see below.
+- **`OverlayTestMode` was restored to a hardcoded `0` on detach** rather than to whatever DWM had. The original value is now captured before the first write and restored verbatim.
+- **Staging the DLL threw if the file was locked.** During a display change the previous instance is still mapped into `dwm.exe`, so the copy is refused; that surfaced as an unhandled `IOException` dialog. Staging now reuses an identical staged copy, retries longer if the build genuinely differs, and skips the injection rather than taking the app down.
+
+### Injector — how the teardown is now caught (`vector<DeviceInfo>::erase` hook)
+- **Was:** the release was gated on a per-device "lost" flag checked at the entry of `CDeviceManager::ProcessDeviceLost`. That never fired in practice: DWM sets those flags *during* that function's own body, so the check always saw a clean vector — and reading it without DWM's device lock made it worse.
+- **The actual erase path** is `CDeviceManager::DeleteUnusedDevices`, which removes a device on **either** the lost flag **or** an idle test (refcount back to 1, no outstanding work, past a grace deadline). The idle path is the common one and cannot be predicted from outside: its deadline is in DWM's own composition units, so wall-clock and frame-count estimates both drift against it as the compositing rate changes — too eager on battery in one direction, too slow in the other.
+- **Is:** the engine hooks `std::vector<DeviceInfo>::erase` — the single call site by which a device is removed, and the frame directly above `CD3DDevice::Release`. At its entry the device is still alive and its final `Release` has not run, so releasing there is correct by construction: no threshold, no tuning, no power-state sensitivity. Verified on AC, on battery, and on 21H2.
+
+### Injector — profile additions
+- `deleteUnusedDevices` — AOB signature for `CDeviceManager::DeleteUnusedDevices`. Byte-identical across 8246 / 8655 / 8875 / 8935.
+- `eraseCallOffset` (`0x47`) — byte offset, inside that function, of the `call rel32` to `vector<DeviceInfo>::erase`. The signature only covers the first 38 bytes and so cannot validate this call site; keeping it in the profile means a future build that moves it needs one number changed rather than new code. A mismatch is detected at load (the byte must be `0xE8`) and logged as `device teardown is UNPROTECTED`.
+- `deviceRefCountOffset` (`0x08`) — CD3DDevice refcount, used only by the diagnostic build.
+- The device-manager **critical section** and the erase function's address are both derived from the resolved function body rather than stored, so neither needs a per-build entry.
+- `processDeviceLost` remains in the table but is **no longer used**, and is labelled as such.
+
+### Injector — removals and cost
+- The `ProcessDeviceLost` hook, its resolution, and its helper are gone: the erase hook covers every removal path, and that hook walked DWM's device vector on every composited frame for a signal that never fired.
+- `CDeviceManager::DeleteUnusedDevices` is still resolved (that is where the erase address comes from) but is **only hooked in diagnostic builds** — it samples the device vector under DWM's own lock, which a release build has no reason to pay for once per frame.
+- Roughly 100 lines of superseded machinery removed, including a dead render-target cache struct.
+- **Release builds now do no per-frame work** for teardown safety: a single hook that fires only when a device is genuinely removed.
+
+### GUI — connecting a monitor no longer applies LUTs by itself
+- **Was:** any display-configuration change re-injected, and injection applies whatever LUTs are assigned. Plugging in a monitor with the tool open but LUTs disabled would switch them on.
+- **Is:** the applied state is captured before the monitor list refreshes, and LUTs are re-applied only if they were already applied. Re-applying in that case is still necessary, because the staged `.cube` files are named after the old desktop coordinates.
+
+### GUI — tooltips
+- **Readable.** There was no `ToolTip` style, so tooltips used the default light Windows popup while the app-wide text style paints white — white on near-white. They now match the dark theme, wrap, and stay up long enough to read.
+- **Complete.** Coverage went from 12 to 37: every row label and its per-monitor value cell, About, the hotkey / autostart / gamma / LUT labels, Apply, Disable and the status line.
+- **Consistent.** A tooltip inherits `FontWeight` and `TextAlignment` from the element it belongs to, so bold and right-aligned labels produced bold, right-aligned tooltips. Those properties are now reset at the tooltip, which also immunises any tooltip added later.
+
+---
+---
+
 ## v1.2.1
 
 ### GUI — display mode is reported accurately (`HdrInfo.cs`, `MonitorData.cs`)
@@ -316,4 +360,4 @@ Windows composites SDR content into the HDR (scRGB) space using the **piecewise 
 
 ---
 
-*Last Updated: 4 August 2026*
+*Last Updated: 5 August 2026*

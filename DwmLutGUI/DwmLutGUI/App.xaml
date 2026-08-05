@@ -35,6 +35,7 @@
 
         <Style TargetType="TextBlock">
             <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
+            <Setter Property="ToolTipService.ShowDuration" Value="30000" />
         </Style>
 
         <Style TargetType="Label">
@@ -49,6 +50,7 @@
         </Style>
 
         <Style TargetType="Button">
+            <Setter Property="ToolTipService.ShowDuration" Value="30000" />
             <Setter Property="Background" Value="{StaticResource ControlBrush}" />
             <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
             <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
@@ -111,6 +113,7 @@
         </Style>
 
         <Style TargetType="ComboBox">
+            <Setter Property="ToolTipService.ShowDuration" Value="30000" />
             <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="Padding" Value="6,3" />
@@ -301,6 +304,44 @@
                     </Setter>
                 </Trigger>
             </Style.Triggers>
+        </Style>
+
+
+        <!-- ===== Tooltips =====
+             There was no implicit ToolTip style, so tooltips fell back to the default Windows popup:
+             a light background, while the app-wide TextBlock style paints text white - white on
+             near-white, effectively unreadable. Same root cause as the buttons and the scrollbars.
+             Wraps as well, since several of these descriptions are long. -->
+        <Style TargetType="ToolTip">
+            <Setter Property="OverridesDefaultStyle" Value="True" />
+            <Setter Property="MaxWidth" Value="420" />
+            <!-- Reset the inheritable text properties. A tooltip inherits FontWeight, FontStyle and
+                 TextAlignment from the element it belongs to, so without these the "Monitor" label and
+                 the monitor-name cell (both FontWeight="Bold") produced bold tooltips, and every row
+                 label produced right-aligned ones because the RowLabel style sets TextAlignment=Right. -->
+            <Setter Property="FontWeight" Value="Normal" />
+            <Setter Property="FontStyle" Value="Normal" />
+            <Setter Property="HorizontalContentAlignment" Value="Left" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ToolTip">
+                        <Border Background="{StaticResource SurfaceBrush}"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="1" CornerRadius="4" Padding="9,7">
+                            <ContentPresenter>
+                                <ContentPresenter.Resources>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
+                                        <Setter Property="TextWrapping" Value="Wrap" />
+                                        <Setter Property="TextAlignment" Value="Left" />
+                                        <Setter Property="FontWeight" Value="Normal" />
+                                    </Style>
+                                </ContentPresenter.Resources>
+                            </ContentPresenter>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
         </Style>
 
     </Application.Resources>

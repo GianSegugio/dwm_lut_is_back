@@ -725,6 +725,11 @@ namespace DwmLutGUI
             // settling, so they are ignored until the operation completes.
             if (_suppressDisplayEvents) return;
 
+            // Captured before the refresh: connecting a display must not turn the LUT on by itself.
+            // ReInject() injects whenever any monitor has a LUT assigned, so without this a plugged-in
+            // monitor would silently apply LUTs the user had deliberately disabled.
+            var wasActive = IsActive;
+
             var oldState = string.Join(";", Monitors.Select(m => m.Position + "|" + m.SdrLutPath + "|" + m.HdrLutPath));
 
             UpdateMonitors();
@@ -736,7 +741,10 @@ namespace DwmLutGUI
                 return;
             }
 
-            if (!_configChanged)
+            // Re-apply only if the LUT was already applied: the display layout changed, so the staged
+            // .cube files are named for the old positions and need restaging. If it was off, leave it
+            // off - the new monitor list is already refreshed above.
+            if (wasActive && !_configChanged)
             {
                 ReInject();
             }

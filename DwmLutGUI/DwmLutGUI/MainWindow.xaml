@@ -45,7 +45,8 @@
 
     <DockPanel Background="{StaticResource BackgroundBrush}">
         <StatusBar DockPanel.Dock="Bottom">
-            <TextBlock Text="{Binding ActiveText, StringFormat=Status: {0}}" />
+            <TextBlock Text="{Binding ActiveText, StringFormat=Status: {0}}"
+                       ToolTip="Active when a LUT and/or the HDR gamma fix is in effect; Inactive when neither is. &quot;(changed)&quot; means a LUT was reassigned and Apply will re-apply it." />
         </StatusBar>
 
         <DockPanel Margin="6" Background="{StaticResource BackgroundBrush}">
@@ -53,8 +54,10 @@
             <!-- Bottom bar: hotkey on the left, LUT + gamma actions on the right -->
             <Grid DockPanel.Dock="Bottom" Margin="0,6,0,0">
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Bottom">
-                    <Button Content="About" Width="75" Click="AboutButton_Click" />
-                    <TextBlock Text="Hotkey:" VerticalAlignment="Center" Margin="12,0,6,0" />
+                    <Button Content="About" Width="75" Click="AboutButton_Click"
+                            ToolTip="Version, credits and project links." />
+                    <TextBlock Text="Hotkey:" VerticalAlignment="Center" Margin="12,0,6,0"
+                               ToolTip="Global key that applies or disables all LUTs, from anywhere." />
                     <ComboBox x:Name="ToggleKeyCombo" SelectedItem="{Binding ToggleKey}" MinWidth="110"
                               VerticalAlignment="Center"
                               ToolTip="Global key that applies or disables all LUTs" />
@@ -63,6 +66,7 @@
                          the text off a constant left edge, and matching the lead-in matters more than
                          the ~6px the button shifts when the label flips between the two states. -->
                     <TextBlock Text="{Binding AutostartLabel}" VerticalAlignment="Center"
+                               ToolTip="Whether DwmLut is registered to start automatically at logon."
                                Margin="12,0,6,0" />
                     <Button Content="{Binding AutostartButtonText}" MinWidth="80"
                             IsEnabled="{Binding CanToggleAutostart}" Click="AutostartToggle_Click"
@@ -81,6 +85,7 @@
                     </Grid.RowDefinitions>
 
                     <TextBlock Grid.Row="0" Grid.Column="0" Text="{Binding GammaFixLabel}"
+                               ToolTip="Replaces the piecewise sRGB curve Windows uses to map SDR content into the HDR space with a pure gamma curve. Shows a countdown while a DWM restart settles."
                                VerticalAlignment="Center" TextAlignment="Right" Margin="0,0,6,6" />
                     <ComboBox Grid.Row="0" Grid.Column="1" Width="60" Margin="0,0,6,6"
                               VerticalAlignment="Center"
@@ -95,11 +100,14 @@
                             ToolTip="Restore Windows' stock piecewise sRGB curve for SDR content. Also restarts DWM." />
 
                     <TextBlock Grid.Row="1" Grid.Column="1" Text="LUT:" VerticalAlignment="Center"
+                               ToolTip="Apply or disable the per-monitor 3D LUTs."
                                TextAlignment="Right" Margin="0,0,6,0" />
                     <Button Grid.Row="1" Grid.Column="2" IsEnabled="{Binding CanApplyLut}" Content="Apply"
-                            Width="75" Margin="0,0,6,0" Click="Apply_Click" />
+                            Width="75" Margin="0,0,6,0" Click="Apply_Click"
+                            ToolTip="Inject into DWM and apply the assigned LUTs. Also re-applies after a LUT is changed, which is what the &quot;Active (changed)&quot; status prompts." />
                     <Button Grid.Row="1" Grid.Column="3" Content="Disable" Width="75"
-                            IsEnabled="{Binding CanDisableLut}" Click="Disable_Click" />
+                            IsEnabled="{Binding CanDisableLut}" Click="Disable_Click"
+                            ToolTip="Unload from DWM and stop applying LUTs. Does not affect the HDR gamma fix, which has its own Off button." />
                 </Grid>
             </Grid>
 
@@ -127,15 +135,23 @@
                         <Border Grid.Row="5" Background="{StaticResource RowStripeBrush}" />
                         <Border Grid.Row="8" Grid.RowSpan="2" Background="{StaticResource RowStripeBrush}" />
 
-                        <TextBlock Grid.Row="0" Text="Monitor"   Style="{StaticResource RowLabel}" FontWeight="Bold" />
-                        <TextBlock Grid.Row="1" Text="#"         Style="{StaticResource RowLabel}" />
-                        <TextBlock Grid.Row="2" Text="Connector" Style="{StaticResource RowLabel}" />
-                        <TextBlock Grid.Row="3" Text="Position"  Style="{StaticResource RowLabel}" />
-                        <TextBlock Grid.Row="4" Text="Mode"      Style="{StaticResource RowLabel}" />
-                        <TextBlock Grid.Row="5" Text="Status"    Style="{StaticResource RowLabel}" />
-                        <TextBlock Grid.Row="6" Text="SDR LUT"   Style="{StaticResource RowLabel}" Margin="6,6,8,0" />
+                        <TextBlock Grid.Row="0" Text="Monitor"   Style="{StaticResource RowLabel}" FontWeight="Bold"
+                                   ToolTip="The display's name as reported by Windows. Hover a monitor's name for its full device path." />
+                        <TextBlock Grid.Row="1" Text="#"         Style="{StaticResource RowLabel}"
+                                   ToolTip="Stable, globally unique display index. Independent of per-adapter source IDs, so it does not change when other displays are connected." />
+                        <TextBlock Grid.Row="2" Text="Connector" Style="{StaticResource RowLabel}"
+                                   ToolTip="How the display is attached: Internal, DisplayPort, HDMI and so on." />
+                        <TextBlock Grid.Row="3" Text="Position"  Style="{StaticResource RowLabel}"
+                                   ToolTip="The display's top-left corner in the Windows desktop coordinate space. LUT files are named after these coordinates, e.g. -1280_0.cube." />
+                        <TextBlock Grid.Row="4" Text="Mode"      Style="{StaticResource RowLabel}"
+                                   ToolTip="The display's current advanced-colour mode. SDR, WCG (Windows' Auto Color Management on an SDR display) or HDR. A WCG display is not HDR, but it is composited in FP16 and so uses the HDR LUT slot." />
+                        <TextBlock Grid.Row="5" Text="Status"    Style="{StaticResource RowLabel}"
+                                   ToolTip="Whether a LUT is currently applied to this display, and whether it is being composited windowed or fullscreen." />
+                        <TextBlock Grid.Row="6" Text="SDR LUT"   Style="{StaticResource RowLabel}" Margin="6,6,8,0"
+                                   ToolTip="The .cube applied while this display is in SDR mode." />
                         <TextBlock Grid.Row="7" Text=""          Style="{StaticResource RowLabel}" />
-                        <TextBlock Grid.Row="8" Text="HDR LUT"   Style="{StaticResource RowLabel}" Margin="6,6,8,0" />
+                        <TextBlock Grid.Row="8" Text="HDR LUT"   Style="{StaticResource RowLabel}" Margin="6,6,8,0"
+                                   ToolTip="The .cube applied while this display is in HDR or WCG mode. Must use BT.2020 primaries with SMPTE ST 2084 (PQ) encoding." />
                         <TextBlock Grid.Row="9" Text=""          Style="{StaticResource RowLabel}" />
                     </Grid>
 
@@ -171,12 +187,12 @@
                                         <TextBlock Grid.Row="0" Text="{Binding Name}" FontWeight="Bold"
                                                    Margin="8,0,8,0" TextTrimming="CharacterEllipsis"
                                                    ToolTip="{Binding DevicePath}" />
-                                        <TextBlock Grid.Row="1" Text="{Binding DisplayIndex}"
+                                        <TextBlock Grid.Row="1" ToolTip="Stable, globally unique display index. Independent of per-adapter source IDs, so it does not change when other displays are connected." Text="{Binding DisplayIndex}"
                                                    Style="{StaticResource CellText}" />
-                                        <TextBlock Grid.Row="2" Text="{Binding Connector}" Style="{StaticResource CellText}" />
-                                        <TextBlock Grid.Row="3" Text="{Binding Position}"  Style="{StaticResource CellText}" />
-                                        <TextBlock Grid.Row="4" Text="{Binding HdrStatus}" Style="{StaticResource CellText}" />
-                                        <TextBlock Grid.Row="5" Text="{Binding Status}"    Style="{StaticResource CellText}" />
+                                        <TextBlock Grid.Row="2" ToolTip="How the display is attached: Internal, DisplayPort, HDMI and so on." Text="{Binding Connector}" Style="{StaticResource CellText}" />
+                                        <TextBlock Grid.Row="3" ToolTip="The display's top-left corner in the Windows desktop coordinate space. LUT files are named after these coordinates, e.g. -1280_0.cube." Text="{Binding Position}"  Style="{StaticResource CellText}" />
+                                        <TextBlock Grid.Row="4" ToolTip="The display's current advanced-colour mode. SDR, WCG (Windows' Auto Color Management on an SDR display) or HDR. A WCG display is not HDR, but it is composited in FP16 and so uses the HDR LUT slot." Text="{Binding HdrStatus}" Style="{StaticResource CellText}" />
+                                        <TextBlock Grid.Row="5" ToolTip="Whether a LUT is currently applied to this display, and whether it is being composited windowed or fullscreen." Text="{Binding Status}"    Style="{StaticResource CellText}" />
 
                                         <ComboBox Grid.Row="6" Margin="8,6,8,0" ItemsSource="{Binding SdrLuts}"
                                                   SelectedItem="{Binding SdrLutPath, UpdateSourceTrigger=PropertyChanged}"
@@ -192,7 +208,7 @@
                                         <StackPanel Grid.Row="7" Orientation="Horizontal" Margin="8,3,8,0">
                                             <Button Content="Browse" Style="{StaticResource MiniButton}"
                                                     Click="SdrLutBrowse_Click"
-                                                    ToolTip="Pick an SDR LUT file for this monitor" />
+                                                    ToolTip="Pick an SDR LUT file for this monitor and add it to its list." />
                                             <Button Content="Next" Style="{StaticResource MiniButton}"
                                                     Click="SwitchSdrLut_Click"
                                                     ToolTip="Cycle this monitor to its next SDR LUT" />
@@ -215,7 +231,7 @@
                                         <StackPanel Grid.Row="9" Orientation="Horizontal" Margin="8,3,8,0">
                                             <Button Content="Browse" Style="{StaticResource MiniButton}"
                                                     Click="HdrLutBrowse_Click"
-                                                    ToolTip="Pick an HDR LUT file for this monitor" />
+                                                    ToolTip="Pick an HDR LUT file for this monitor and add it to its list." />
                                             <Button Content="Next" Style="{StaticResource MiniButton}"
                                                     Click="SwitchHdrLut_Click"
                                                     ToolTip="Cycle this monitor to its next HDR LUT" />

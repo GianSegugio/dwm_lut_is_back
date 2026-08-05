@@ -87,11 +87,22 @@ Each supported `dwmcore.dll` build is one **`DwmProfile`** row in `g_dwmProfiles
 ### HDR / SDR LUT selection
 DWM composites an HDR display into an FP16 (scRGB) backbuffer and an SDR display into an 8/10-bit backbuffer, and the shader applies the LUT through an HDR (PQ/BT.2100) or SDR path accordingly — so a LUT is only valid for the mode it was calibrated in. The engine matches **exactly**: an HDR context takes the HDR LUT, an SDR context takes the SDR LUT. If the only LUT assigned to a display is the wrong type for its current mode, **no LUT is applied** rather than a mismatched one (which, run through the other path, would produce wrong colors). Use an HDR LUT (a `.cube` with `hdr` in the filename, calibrated in HDR) for a display in HDR mode, and an SDR LUT for SDR mode. A display in **WCG** mode (Auto Color Management on an SDR display) composites in FP16 like an HDR one, so it takes the **HDR** LUT slot — but the surface is not PQ-encoded the way true HDR10 is, so a LUT authored for an HDR10 display will not be correct there.
 
-### Fullscreen Device-Lost Handling
-Recent DWM builds run a **resource-leak checker** that deliberately breaks (`int 3`, crashing DWM) if it destroys one of its internal D3D devices while resources are still alive on it. 
-Because the engine's LUT resources live on DWM's device, a real display-mode change (for example an old DirectDraw game entering a native-resolution fullscreen) would tear down a device that still held them and crash DWM. 
-The engine hooks DWM's device-lost handler (`CDeviceManager::ProcessDeviceLost`) and, at its entry, releases **all** LUT resources **only when DWM is actually about to remove a device** — a decision it makes by reading DWM's own internal device list and checking each device's "lost" flag (a bounds-checked, exception-guarded read). 
-The handler runs every frame, so this release is gated rather than unconditional. The resources rebuild on the recovered device on the next frame, so the LUT returns automatically when the app leaves fullscreen. The same release also **resets the 1:1 context-to-origin ownership map**: DWM destroys and recreates its overlay contexts across a mode change, and a recreated context resolving to an origin still "owned" by a now-destroyed one would otherwise be skipped and left without its LUT. (The LUT is still not *guaranteed* while an exclusive/mode-changed fullscreen is up — only the crash is prevented and the recovery afterward is clean.)
+### Device teardown (fullscreen mode changes and monitor hot-plug)
+Recent DWM builds run a **resource-leak checker** on every internal D3D device they destroy: it performs the device's final `Release` and deliberately breaks (`int 3`, crashing DWM) if the refcount does not come back zero.
+Because the engine's LUT resources live on DWM's device — and in D3D11 every child object keeps its device alive — anything of ours still outstanding when DWM destroys a device turns a routine event into a `dwm.exe` crash.
+
+DWM removes a device inside `CDeviceManager::DeleteUnusedDevices`, which erases on **either** of two tests: a per-device "lost" flag, or an idle path (the device's own refcount back to 1, no outstanding work, and past a grace deadline). The idle path is by far the common one, and it is not predictable from outside: its deadline is expressed in DWM's own composition units, so a wall-clock or frame-count estimate of "about to be erased" drifts against it whenever the compositing rate changes.
+
+The engine therefore does not predict it. It hooks **`std::vector<DeviceInfo>::erase`** itself — the single call site by which a device is removed, and the frame directly above `CD3DDevice::Release`. At its entry the device is still alive and its final `Release` has not run, so releasing there is correctly timed by construction: no threshold, no tuning, and no sensitivity to power state. Its address is derived from the `call rel32` at `eraseCallOffset` inside `DeleteUnusedDevices`, so no additional per-build address is stored.
+
+The release drops every LUT asset and also **resets the 1:1 context-to-origin ownership map**: DWM destroys and recreates its overlay contexts across a topology change, and a recreated context resolving to an origin still "owned" by a destroyed one would otherwise be skipped and left without its LUT. Assets rebuild on the next frame, so the LUT returns automatically once the new configuration settles.
+
+Three supporting measures close the remaining ways a reference could survive:
+- **Render state is unbound after every draw.** D3D's immediate context holds references to whatever is bound to it, so releasing our own handles is not enough while our render target, shaders, samplers and SRVs are still bound.
+- **Adapters with no applicable LUT are never touched.** Building assets takes a strong reference to that adapter's device; a display with no LUT must leave no footprint on its adapter, or unplugging it destroys a device we had no reason to hold.
+- **Detach releases before unhooking.** The DLL sets its kill switch, drains in-flight hook bodies, releases every D3D reference, and only then removes its hooks — so there is no window in which a reference is held with no hook able to evict it.
+
+(The LUT is still not *guaranteed* while an exclusive/mode-changed fullscreen is up — only the crash is prevented and the recovery afterward is clean.)
 
 ### Fail-Safe Design
 - A process-wide **kill-switch** makes every hook return immediately once tripped, so DWM composites normally instead of crash-looping (tripped by the render-path exception boundary and on DLL detach).
@@ -115,17 +126,20 @@ This is corrected by rewriting the four sRGB constants inside DWM's own SDR→sc
 
 ## Reverse-engineering reference (verified against 26100.8246)
 
-| Symbol | Location |
-|---|---|
-| `COverlayContext::Present` | RVA `0x232A20` (unique) |
-| `COverlayContext::OverlaysEnabled` | RVA `0x18893C` (unique) |
-| `OverlayTestMode` global | RVA `0x3FE1C4` (`.data`), forced to `5` |
-| `COverlayContext::IsCandidateDirectFlipCompatible` | RVA `0x5E7D4` (member `0x4BF8`) — not `0x14818` |
-| `IOverlaySwapChain` vtable | `.rdata` RVA `0x30CB48` (slot 24 = backbuffer-array accessor) |
-| Per-monitor desktop origin | `self + 0x7658` (float `left, top`) |
-| Per-monitor native resolution | `self + 0x4A24` (`0,0,W,H`) — alternate identifier |
-| `CDeviceManager::ProcessDeviceLost` | RVA `0x0EF370` (unique 33-byte prologue; hooked for the device-lost fix) |
-| DWM device vector (`CDeviceManager`) | `.data` `_Myfirst`/`_Mylast` RVA `0x3FDA88`/`0x3FDA90`; `DeviceInfo` stride `0x10`; lost-flag `device+0x458` |
+| Symbol                                             | Location                                                                                                     |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `COverlayContext::Present`                         | RVA `0x232A20` (unique)                                                                                      |
+| `COverlayContext::OverlaysEnabled`                 | RVA `0x18893C` (unique)                                                                                      |
+| `OverlayTestMode` global                           | RVA `0x3FE1C4` (`.data`), forced to `5`                                                                      |
+| `COverlayContext::IsCandidateDirectFlipCompatible` | RVA `0x5E7D4` (member `0x4BF8`) — not `0x14818`                                                              |
+| `IOverlaySwapChain` vtable                         | `.rdata` RVA `0x30CB48` (slot 24 = backbuffer-array accessor)                                                |
+| Per-monitor desktop origin                         | `self + 0x7658` (float `left, top`)                                                                          |
+| Per-monitor native resolution                      | `self + 0x4A24` (`0,0,W,H`) — alternate identifier                                                           |
+| `CDeviceManager::ProcessDeviceLost`                | RVA `0x0EF370` (unique 33-byte prologue; no longer hooked)                                                   |
+| `CDeviceManager::DeleteUnusedDevices`              | RVA `0x0EF470` (unique 38-byte prologue; erases on lost-flag **or** idle test)                               |
+| `std::vector<DeviceInfo>::erase`                   | RVA `0x0EFD14` — **hooked**; reached only from `DeleteUnusedDevices+0x47`, the sole device-removal path      |
+| Device-manager `CRITICAL_SECTION`                  | `.data` RVA `0x3FDA60`, entered by `DeleteUnusedDevices+0x11`; guards the device vector                      |
+| DWM device vector (`CDeviceManager`)               | `.data` `_Myfirst`/`_Mylast` RVA `0x3FDA88`/`0x3FDA90`; `DeviceInfo` stride `0x10`; lost-flag `device+0x458` |
 
 ***26100.8655 delta:** same structure, shifted RVAs — `Present` `0x231800`, `OverlaysEnabled` `0x1A2BE8`, `IsCandidateDirectFlipCompatible` `0xB1414` (member `0x4BF8`), `ProcessDeviceLost` `0xDCF80`, and device vector `_Myfirst`/`_Mylast` `0x3FAB78`/`0x3FAB80`. Signature bytes, clip-box `0x7658`, stride `0x10`, and lost-flag `0x458` are unchanged.*
 ***26100.8875 delta:** signature bytes unchanged (all four match uniquely) — `Present` `0x231530`, `OverlaysEnabled` `0xA048`, `IsCandidateDirectFlipCompatible` `0x6E1F4`, `ProcessDeviceLost` `0xB3780`. Device vector `_Myfirst`/`_Mylast` moved to `0x3FCC98`/`0x3FCCA0`; clip-box `0x7658`, stride `0x10`, and lost-flag `0x458` unchanged.*
@@ -145,6 +159,10 @@ This is corrected by rewriting the four sRGB constants inside DWM's own SDR→sc
 | `deviceVecLastRva` (_Mylast)   | `0x3FDA90`                    | `0x3FAB80`                    | `0x3FCCA0`        | **`0x3FAD40`**      | **yes**    |
 | `deviceInfoStride`             | `0x10`                        | `0x10`                        | `0x10`            | `0x10`              | same       |
 | `deviceLostFlagOffset`         | `0x458`                       | `0x458`                       | `0x458`           | `0x458`             | same       |
+| `DeleteUnusedDevices` sig      | @ RVA 0xEF470                 | @ RVA 0xDD080                 | @ RVA 0xB3880     | @ RVA 0xB93D0       | same bytes |
+| `vector<DeviceInfo>::erase`    | @ RVA 0xEFD14                 | @ RVA 0xDD924                 | @ RVA 0xB4124     | @ RVA 0xB9C74       | derived    |
+| device `CRITICAL_SECTION`      | `0x3FDA60`                    | `0x3FAB50`                    | `0x3FCC70`        | `0x3FAD10`          | derived    |
+| `eraseCallOffset` / `deviceRefCountOffset` | `0x47` / `0x08`   | `0x47` / `0x08`               | `0x47` / `0x08`   | `0x47` / `0x08`     | same       |
 
 ---
 
@@ -162,11 +180,12 @@ Only one instance may run, because it owns the injected DLL and the tray icon. A
 - **SDR-in-HDR gamma fix restarts DWM:** Because DWM builds its pixel shaders at startup, switching the fix on or off requires a fresh DWM — a brief black flash, and any per-session compositor state is rebuilt. Consecutive toggles are therefore rate-limited (the buttons are disabled with a short countdown between them): restarting the display pipeline several times in quick succession has been observed to leave a multi-monitor setup in a bad state, with a display dropping out and scaling/HDR reset until reconnected or rebooted. Set the fix once rather than toggling it repeatedly. The patch is memory-only — it never modifies `dwmcore.dll` on disk and is gone after any DWM restart or reboot — so a normal LUT Apply / Disable, which does *not* restart DWM, will not carry it over.
 - **A WCG display needs its own LUT, not an HDR10 one:** when Auto Color Management puts an SDR display into WCG (advanced color), Windows composites it into the same FP16 (scRGB) surface as HDR, so the LUT is taken from the **HDR** slot and the shader applies it in the PQ / BT.2100 domain. The panel is still a wide-gamut display at SDR luminance, though, not an HDR10 one — its peak luminance and response are different — so a LUT authored for, or measured on, a genuine HDR10 display will not be correct there. A LUT for a WCG display has to be measured on that display while it is in WCG mode. Turning "Automatically manage color for apps" off returns the display to plain SDR and to the SDR LUT slot.
 - **Autostart needs the scheduled task to be creatable:** autostart is a Task Scheduler entry running with highest privileges (a plain `Run` registry entry would prompt for UAC at every logon, since the app requires administrator rights). If policy or an error prevents `schtasks` from registering it, the failure is reported and the setting stays off rather than silently appearing to have worked. The task carries a 15-second delay, because logon fires before the display topology has settled and applying immediately can run against monitors that are not yet enumerated.
+- **Device-teardown safety depends on one unguarded offset:** the release that keeps `dwm.exe` alive across a device removal is a hook on `std::vector<DeviceInfo>::erase`, whose address is derived from the `call rel32` at `eraseCallOffset` (`0x47`) inside `CDeviceManager::DeleteUnusedDevices`. That function's AOB signature only covers its first 38 bytes, so a future build could still match the signature while having moved the call. This is checked at load — the byte must be `0xE8` — and a mismatch is logged as `FAILED to resolve vector<DeviceInfo>::erase - device teardown is UNPROTECTED`, which is the line to look for if monitor hot-plug starts crashing DWM again after a Windows update. The fix in that case is one number in the profile.
 - **Crash proof, update vulnerable:** When a Windows update breaks the tool, the symptom points to the cause:
   - *Nothing happens at all* → a `COverlayContext` **signature** moved (most likely `Present`), or the running dwmcore has **no matching profile**.
   - *Wrong monitor / wrong colors, or only the primary display gets its LUT* → the clip-box **offset** moved (per build: `0x7658` on 8246 / 8655 / 8875, `0x7648` on 8935), or `GetBackBuffer_25H2`'s `vt[24]`/`vt2[19]` indices moved. Note that dwmcore also carries a monitor-**local** clip box a few fields away that always reads `(0,0)`; picking that one by mistake makes every display collide on one origin, so only the primary is color-managed. The `DIAG_MONITOR_MATCH` build switch dumps every clip-box-shaped RECT per context and is the reliable way to tell them apart on a multi-monitor layout.
   - *Flicker / LUT dropping out on a surface* → `OverlayTestMode` / the overlay hooks moved.
-  - *DWM crashes again on a fullscreen mode change* → the `ProcessDeviceLost` signature or a device-vector offset moved (per build; `0x3FDA88`/`0x3FDA90` on 8246, `0x3FAB78`/`0x3FAB80` on 8655, `0x3FCC98`/`0x3FCCA0` on 8875, `0x3FAD38`/`0x3FAD40` on 8935; stride `0x10`, flag `0x458`).
+  - *DWM crashes on a monitor being connected/disconnected, or on a fullscreen mode change* → the device-teardown release is not firing. Check the diagnostic log for `FAILED to resolve vector<DeviceInfo>::erase - device teardown is UNPROTECTED`: that means the `CDeviceManager::DeleteUnusedDevices` signature still matched but the `call rel32` to the erase moved, so `eraseCallOffset` (`0x47`) needs updating. If instead the log shows `FAILED to find CDeviceManager::DeleteUnusedDevices (signature miss)`, the signature itself moved. The crash is always the same `CD3DResourceLeakChecker` `int 3` in `dwmcore`, reached via `DeleteUnusedDevices` → `vector<DeviceInfo>::erase` → `CD3DDevice::Release`. (The device-vector offsets and `deviceLostFlagOffset` are read only by the `DIAG_MONITOR_MATCH` build and cannot cause this.)
   - *DWM crashes when a video/app goes fullscreen (overlay path)* → a hooked overlay function is being relied upon by DWM to preserve a volatile register across the call. On 25H2 `OverlaysEnabled` is left unhooked for this reason; if a similar crash appears with another overlay hook (`IsCandidateDirectFlipCompatible` family) in the stack, it needs the same treatment.
   Adding support for a new build is a **single prepended `g_dwmProfiles[]` entry**, but obtaining the values is a reverse-engineering pass (disassembly + live capture).
 - **Exclusive / mode-changed fullscreen is not *guaranteed* to be color-managed:** (e.g. old DirectDraw games switching to a native-resolution fullscreen): such surfaces bypass DWM composition, so the LUT is not reliably reachable (matches ledoge's original limitation). This **no longer crashes DWM** and **recovers its LUTs cleanly on exit**, even on a multi-GPU / multi-monitor setup. The LUT may remain applied through such a fullscreen DWM bypass, now that resources stay stable across the transition, but that is not guaranteed. A LUT is applied only while DWM **composites** a surface. When a fullscreen or borderless game presents a flip-model swapchain that DWM promotes to **IndependentFlip** (direct scanout), the frames bypass composition entirely, so no LUT can be applied. This is a DWM decision, made per frame from swapchain state, occlusion, the mouse cursor, and MPO capability, with **no hookable entry point on 25H2** — the relevant `CCompSwapChain` / `CWindowContext` flip-candidate checks are unreachable there. Exclusive-fullscreen apps bypass DWM outright and likewise cannot be reached. Windowed and *composited* fullscreen surfaces (most fullscreen browser video, and legacy fullscreen games that DWM still composites) do get the LUT.
@@ -174,4 +193,4 @@ Only one instance may run, because it owns the injected DLL and the tray icon. A
 
 ---
 
-*Last Updated: 4 August 2026*
+*Last Updated: 5 August 2026*
