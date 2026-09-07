@@ -3,7 +3,7 @@
 ## A fork of ed1ii's [dwm_lut_fixed](https://github.com/ed1ii/dwm_lut_fixed) adjusted for **Windows 11 25H2 build >= 26200.8246**
 
 > [!WARNING]
-> **This fork has been developed to add 25H2 support:** it has been validated on Windows 11 25H2 builds 26200.8246, 26200.8655 and 26200.8875 fresh installs, with multiple SDR and HDR monitors, plus Windows 11 21H2 (22000.1880) and a 26H2 preview (26300). While there is some support for Windows versions older than 25H2 (read [documentation](DOCUMENTATION.md) for details), the tool is not guaranteed to work on 25H2 builds prior 26200.8246 for which LUT application is skipped entirely as a safety measure. Furthermore keep in mind that any future Windows 11 update may introduce DWM changes that break the current tool configuration.
+> **This fork has been developed to add 25H2 support:** it has been validated on fresh installs of the Windows 11 builds listed in [SUPPORTED_VERSIONS.txt](SUPPORTED_VERSIONS.txt), with multiple SDR and HDR monitors. While there is some support for Windows versions older than 25H2 (read [documentation](DOCUMENTATION.md) for details), the tool is not guaranteed to work on 25H2 builds prior 26200.8246 for which LUT application is skipped entirely as a safety measure. Furthermore keep in mind that any future Windows 11 update may introduce DWM changes that break the current tool configuration.
 
 > [!CAUTION]
 > This software injects a DLL into `dwm.exe` and hooks undocumented Windows internals.
@@ -25,7 +25,7 @@ Right now it should work on 20H2, 21H1, 21H2, 22H2, 23H2, 24H2, 25H2 builds >= 2
 
 ## Key Features
 
-- **Windows 11 Compatible**: Full support for **25H2 (tested on 26200.8246, 26200.8655 and 26200.8875; newer 25H2 builds apply the latest profile)** plus a **26H2 preview** profile (26300), and tested support for **21H2** (22000.1880). Older Windows versions are supported but untested (read [documentation](DOCUMENTATION.md) for details).
+- **Windows 11 Compatible**: Full support for the builds listed in [SUPPORTED_VERSIONS.txt](SUPPORTED_VERSIONS.txt), newer builds apply the latest profile. Older Windows versions are supported but untested (read [documentation](DOCUMENTATION.md) for details).
 - **Multi-Monitor & Multi-GPU support**: Reliable LUT application across multiple displays and GPUs. Proper discrete GPU and integrated GPU handling with multi-GPU isolation (rendering resources are allocated and validated per graphics adapter and per output).
 - **Crash-resilient across device teardown:** Fullscreen apps that switch resolution (e.g. classic DirectDraw games) and monitors being connected or disconnected both make DWM destroy and recreate its graphics devices. DWM's resource-leak checker crashes the compositor if anything is still holding a device it destroys, so this fork hooks the exact point at which a device is removed and releases its LUT resources there — correctly timed regardless of compositing rate or power state — then rebuilds them automatically afterwards.
 - **Version-keyed build profiles:** Every supported `dwmcore.dll` build's signatures and offsets live in one self-contained table entry keyed by version, so adapting to a future Windows update is a single localized change.
@@ -83,4 +83,4 @@ Third-party components keep their own terms, reproduced in full in [LICENSE-THIR
 
 ---
 
-*Last Updated: 5 August 2026*
+*Last Updated: 7 September 2026*

@@ -429,6 +429,26 @@ struct DwmSignatures
 	unsigned char deleteUnusedDevices[DWM_SIG_MAX]; size_t deleteUnusedDevicesLen;
 };
 
+// How this dwmcore build removes a device, and therefore how the engine catches it to release its
+// resources before DWM's leak checker runs its final Release. Selected per profile so a future build
+// with yet another shape only needs a new enumerator plus its handling, assigned to the rows that use
+// it - no change to the builds already covered.
+enum class TeardownPath
+{
+	// A standalone std::vector<DeviceInfo>::erase exists and is the sole device-removal call. The
+	// engine hooks it directly, via the call at eraseCallOffset inside DeleteUnusedDevices. Builds
+	// 26100.8246 through 26100.9168.
+	EraseHook,
+
+	// std::vector<DeviceInfo>::erase is INLINED into CDeviceManager::DeleteUnusedDevices, so there is
+	// no standalone erase to hook. The inlined loop still calls a per-DeviceInfo DESTROY helper once
+	// per removed device, so the engine hooks THAT (its address comes from the call at eraseCallOffset,
+	// same as EraseHook - only the target function differs). It fires only on a genuine removal, which
+	// is essential: hooking DeleteUnusedDevices itself would fire every composited frame and thrash
+	// assets. The name is kept for the profile/version mapping. Build 26100.9278+.
+	DeleteUnusedDevicesEntry,
+};
+
 struct DwmProfile
 {
 	unsigned long long minVersion;                     // applies when dwmcore version >= this
@@ -448,6 +468,13 @@ struct DwmProfile
 	// offset here means a future build that moves it needs one number changed, not new code. A
 	// mismatch is caught at runtime (the byte must be 0xE8) and logged, so it fails safe.
 	int eraseCallOffset;
+	// Which of the two device-removal shapes this build has (see TeardownPath). Chooses whether the
+	// engine hooks the standalone erase (via eraseCallOffset) or DeleteUnusedDevices at its entry.
+	TeardownPath teardownPath;
+	// Byte offset, inside DeleteUnusedDevices, of the `lea rcx,[rip+rel32]` that loads the device
+	// vector's CRITICAL_SECTION. Was fixed at 0x0A while every build shared a prologue; 26100.9278
+	// saves more registers first and moved it to 0x18, so it lives in the profile now.
+	int deviceLockLeaOffset;
 	// Fullscreen-overlay suppression: on this build, hook COverlayContext::OverlaysEnabled (forcing it
 	// false for LUT contexts) to keep the LUT applied over fullscreen apps. It is installed via the
 	// register-preserving asm thunk (OverlaysEnabled_thunk), because DWM's IsDFlipOnMPO relies on r8
@@ -463,6 +490,73 @@ struct DwmProfile
 // NOTE: signatures are embedded by value, so builds that share the same patterns repeat those bytes.
 static const DwmProfile g_dwmProfiles[] = {
 	// --- add newer dwmcore builds ABOVE (most-recent first) ---
+
+	// Windows 11 25H2 - dwmcore 10.0.26100.9278
+	// Present / IsCandidateDirectFlipCompatible / ProcessDeviceLost still match uniquely, and the
+	// per-monitor DESKTOP clip box stays at 0x7648 -- verified on a 2-monitor setup, origins (0,0) and
+	// (-3840,-293) both read correctly. Two things changed in DeleteUnusedDevices: its prologue now
+	// saves more registers (device-lock lea moved 0x0A -> 0x18) AND the std::vector<DeviceInfo>::erase
+	// is INLINED into it, so there is no standalone erase to hook. TeardownPath::DeleteUnusedDevicesEntry
+	// handles this: the inlined loop still calls a per-DeviceInfo DESTROY helper once per removed device,
+	// and eraseCallOffset (0x9E) points at that call, so the engine hooks the destroy helper - which
+	// fires only on a genuine removal, exactly like the standalone erase on other builds, and unlike
+	// hooking DeleteUnusedDevices itself (which runs every frame). Device-vector globals moved (diag-only).
+	{
+		DWM_VER(26100, 9278),
+		{   // AOB signatures (inline)
+			// COverlayContext::Present
+			{ 0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x6C,
+			  0x24, 0xF9, 0x48, 0x81, 0xEC, 0xF8, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x05,
+			  '?', '?', '?', '?', 0x48, 0x33, 0xC4, 0x48, 0x89, 0x45, 0xEF, 0x4C, 0x8B, 0x65, '?', 0x48, 0x8B, 0xD9 }, 46,
+			// COverlayContext::OverlaysEnabled
+			{ 0x83, 0x3D, '?', '?', '?', '?', 0x05, 0x74, 0x09, 0x83, 0x79, 0x28, 0x01, 0x0F, 0x97, 0xC0, 0xC3 }, 17,
+			// COverlayContext::IsCandidateDirectFlipCompatible
+			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x68, 0x10, 0x48, 0x89, 0x70, 0x18, 0x48,
+			  0x89, 0x78, 0x20, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x20, 0x33, 0xDB }, 27,
+			// CDeviceManager::ProcessDeviceLost (prologue ends in a build-specific lea rcx,[rip+rel32], wildcarded)
+			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x48, 0x08, 0x56,
+			  0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x40, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0x0D, '?', '?', '?', '?' }, 33,
+			// CDeviceManager::DeleteUnusedDevices (26100.9278: saves rbx/rbp/rsi/rcx + push rdi + sub, then
+			// lea rcx,[rip+?] at +0x18. Erase is INLINED; the per-DeviceInfo destroy call at +0x9E is
+			// hooked instead -- see teardownPath / eraseCallOffset below.)
+			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x70, 0x20,
+			  0x48, 0x89, 0x48, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8D, 0x0D }, 27,
+		},
+		0x7648, 0x40EDC8, 0x40EDD0, 0x10, 0x458, 0x08, 0x9E,  // clipBox, vecFirst, vecLast, stride, flag, refcnt, eraseCall(-> inlined-loop's per-DeviceInfo destroy call)
+		TeardownPath::DeleteUnusedDevicesEntry, 0x18,  // teardownPath, deviceLockLeaOffset
+		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
+	},
+
+	// Windows 11 25H2 - dwmcore 10.0.26100.9168
+	// Signatures and the context layout are identical to 8935 (Present, IsCandidateDirectFlipCompatible,
+	// ProcessDeviceLost and DeleteUnusedDevices are all byte-for-byte structurally identical, so the clip box
+	// stays at 0x7648). Only the two device-vector globals moved (0x3FAD38/0x40 -> 0x3FAD58/0x60), tracking a
+	// small .data growth; those are read only by the DIAG_MONITOR_MATCH build. LUT application verified on this
+	// build with v1.2.2.
+	{
+		DWM_VER(26100, 9168),
+		{   // AOB signatures (inline)
+			// COverlayContext::Present
+			{ 0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x6C,
+			  0x24, 0xF9, 0x48, 0x81, 0xEC, 0xF8, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x05,
+			  '?', '?', '?', '?', 0x48, 0x33, 0xC4, 0x48, 0x89, 0x45, 0xEF, 0x4C, 0x8B, 0x65, '?', 0x48, 0x8B, 0xD9 }, 46,
+			// COverlayContext::OverlaysEnabled
+			{ 0x83, 0x3D, '?', '?', '?', '?', 0x05, 0x74, 0x09, 0x83, 0x79, 0x28, 0x01, 0x0F, 0x97, 0xC0, 0xC3 }, 17,
+			// COverlayContext::IsCandidateDirectFlipCompatible
+			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x68, 0x10, 0x48, 0x89, 0x70, 0x18, 0x48,
+			  0x89, 0x78, 0x20, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x20, 0x33, 0xDB }, 27,
+			// CDeviceManager::ProcessDeviceLost (prologue ends in a build-specific lea rcx,[rip+rel32], wildcarded)
+			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x48, 0x08, 0x56,
+			  0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x40, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0x0D, '?', '?', '?', '?' }, 33,
+			// CDeviceManager::DeleteUnusedDevices (identical prologue on 8246/8655/8875/8935/9168)
+			{ 0x48, 0x89, 0x4C, 0x24, 0x08, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8D, 0x0D,
+			  '?', '?', '?', '?', 0x48, 0xFF, 0x15, '?', '?', '?', '?', 0x0F, 0x1F, 0x44, 0x00, 0x00,
+			  0x4C, 0x8B, 0x05, '?', '?', '?', '?', 0x32, 0xDB }, 38,
+		},
+		0x7648, 0x3FAD58, 0x3FAD60, 0x10, 0x458, 0x08, 0x47,  // clipBox, vecFirst, vecLast, stride, flag, refcnt, eraseCall
+		TeardownPath::EraseHook, 0x0A,             // teardownPath, deviceLockLeaOffset
+		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
+	},
 
 	// Windows 11 26H2 preview (OS build 26300) - dwmcore 10.0.26100.8935
 	// Signatures identical to 8875/8655/8246 (all four still match uniquely), but the context layout shifted:
@@ -492,6 +586,7 @@ static const DwmProfile g_dwmProfiles[] = {
 			  0x4C, 0x8B, 0x05, '?', '?', '?', '?', 0x32, 0xDB }, 38,
 		},
 		0x7648, 0x3FAD38, 0x3FAD40, 0x10, 0x458, 0x08, 0x47,  // clipBox, vecFirst, vecLast, stride, flag, refcnt, eraseCall
+		TeardownPath::EraseHook, 0x0A,             // teardownPath, deviceLockLeaOffset
 		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
 	},
 
@@ -517,6 +612,7 @@ static const DwmProfile g_dwmProfiles[] = {
 			  0x4C, 0x8B, 0x05, '?', '?', '?', '?', 0x32, 0xDB }, 38,
 		},
 		0x7658, 0x3FCC98, 0x3FCCA0, 0x10, 0x458, 0x08, 0x47,  // clipBox, vecFirst, vecLast, stride, flag, refcnt, eraseCall
+		TeardownPath::EraseHook, 0x0A,             // teardownPath, deviceLockLeaOffset
 		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
 	},
 
@@ -542,6 +638,7 @@ static const DwmProfile g_dwmProfiles[] = {
 			  0x4C, 0x8B, 0x05, '?', '?', '?', '?', 0x32, 0xDB }, 38,
 		},
 		0x7658, 0x3FAB78, 0x3FAB80, 0x10, 0x458, 0x08, 0x47,  // clipBox, vecFirst, vecLast, stride, flag, refcnt, eraseCall
+		TeardownPath::EraseHook, 0x0A,             // teardownPath, deviceLockLeaOffset
 		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
 	},
 
@@ -567,6 +664,7 @@ static const DwmProfile g_dwmProfiles[] = {
 			  0x4C, 0x8B, 0x05, '?', '?', '?', '?', 0x32, 0xDB }, 38,
 		},
 		0x7658, 0x3FDA88, 0x3FDA90, 0x10, 0x458, 0x08, 0x47,  // clipBox, vecFirst, vecLast, stride, flag, refcnt, eraseCall
+		TeardownPath::EraseHook, 0x0A,             // teardownPath, deviceLockLeaOffset
 		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
 	},
 };
@@ -2026,8 +2124,15 @@ static void EvictAllAssets()
 //   +0x11  call EnterCriticalSection
 static CRITICAL_SECTION* g_dwmDeviceLock = NULL;
 
-// std::vector<CDeviceManager::DeviceInfo>::erase - reached ONLY when a device is actually being
-// removed, and it is the frame directly above CD3DDevice::Release in every crash stack we collected.
+// The device-removal hook. Installed on whichever function actually removes a device on this build
+// (see TeardownPath): on EraseHook builds that is std::vector<DeviceInfo>::erase; on
+// DeleteUnusedDevicesEntry builds the erase is inlined and the real removal is the per-DeviceInfo
+// destroy helper it calls. Either way this fires ONLY on a genuine removal - never per idle frame -
+// and sits directly above CD3DDevice::Release, so releasing our resources here is correctly timed.
+// The target's address is derived from the call at eraseCallOffset inside DeleteUnusedDevices.
+//
+// It is declared with three register args to match the widest target (vector::erase); a target that
+// takes fewer simply ignores the extra registers, and the trampoline is called with the same three.
 //
 // This replaces guessing. Both previous attempts were proxies for "DWM is about to erase": a
 // wall-clock idle timer fired far too eagerly once compositing slowed down on battery, and a
@@ -2051,7 +2156,7 @@ CDeviceManager_DeviceInfoErase_t* CDeviceManager_DeviceInfoErase_orig = NULL;
 
 void* CDeviceManager_DeviceInfoErase_hook(void* a1, void* a2, void* a3)
 {
-	diag_log("device entry being erased -> releasing all LUT assets first");
+	diag_log("device being removed -> releasing all LUT assets first");
 	EvictAllAssets();
 	return CDeviceManager_DeviceInfoErase_orig(a1, a2, a3);
 }
@@ -2073,11 +2178,11 @@ CDeviceManager_DeleteUnusedDevices_t* CDeviceManager_DeleteUnusedDevices_orig = 
 // targets - makes it non-zero and turns an unplug into a dwm.exe crash. Releasing here happens
 // before the erase, so DWM's own Release is genuinely the last one.
 #if DIAG_MONITOR_MATCH
+// DIAGNOSTIC ONLY: logs the device-vector state each frame. The actual teardown release is done by
+// the removal-function hook (CDeviceManager_DeviceInfoErase_hook), which fires only on a genuine
+// device removal - see the hook-creation dispatch. This is never hooked in a release build.
 void CDeviceManager_DeleteUnusedDevices_hook(void* self)
 {
-	// Sample under DWM's own lock so the flags are consistent. The eviction itself is done AFTER
-	// releasing it: releasing D3D objects while holding a DWM lock is asking for a lock-order
-	// inversion, and by then we already know we must drop everything.
 	int count = -1, flagged = 0, unused = 0;
 	if (g_dwmDeviceLock != NULL)
 	{
@@ -2087,26 +2192,16 @@ void CDeviceManager_DeleteUnusedDevices_hook(void* self)
 	DwmDeviceVectorState(&count, &flagged, &unused);
 	if (g_dwmDeviceLock != NULL) LeaveCriticalSection(g_dwmDeviceLock);
 
-	// Runs every frame, so it is throttled - but it must report BOTH a change in the device set and
-	// any call where something is flagged, because those are different events and the flagged one is
-	// the only one we can act on. Note the count alone is not enough: this DLL is re-injected on every
-	// display change, so a per-instance "last count" only ever samples the first call of a session and
-	// can never witness a transition.
 	static int lastCount = -2, lastUnused = -1;
 	if (count != lastCount || flagged > 0 || unused != lastUnused)
 	{
 		const int prev = lastCount;
 		lastCount = count; lastUnused = unused;
 		char b[192];
-		snprintf(b, sizeof(b), "[devlost] DeleteUnusedDevices: %d device(s) (was %d), %d flagged, %d unused(refcnt<=1)%s",
-		         count, prev, flagged, unused, flagged > 0 ? "  <== EVICTING" : "");
+		snprintf(b, sizeof(b), "[devlost] DeleteUnusedDevices entry: %d device(s) (was %d), %d flagged, %d unused(refcnt<=1)",
+		         count, prev, flagged, unused);
 		diag_log(b);
 	}
-
-	// A flagged device is released here as an early opportunity; the guaranteed release happens in
-	// the vector<DeviceInfo>::erase hook, which sits on the only path by which a device is removed.
-	if (flagged > 0)
-		EvictAllAssets();
 
 	CDeviceManager_DeleteUnusedDevices_orig(self);
 }
@@ -2288,22 +2383,29 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 							(int)g_activeDwmProfile->sigs.deleteUnusedDevicesLen))
 						{
 							CDeviceManager_DeleteUnusedDevices_orig = (CDeviceManager_DeleteUnusedDevices_t*)a;
-							// lea rcx,[rip+rel32] at +0x0a -> the CRITICAL_SECTION guarding the
-							// device vector. The signature already pins these three opcodes.
-							if (a[0x0A] == 0x48 && a[0x0B] == 0x8D && a[0x0C] == 0x0D)
+							// lea rcx,[rip+rel32] at deviceLockLeaOffset -> the CRITICAL_SECTION
+							// guarding the device vector (the signature pins these three opcodes).
+							const int lo = g_activeDwmProfile->deviceLockLeaOffset;
+							if (a[lo] == 0x48 && a[lo+1] == 0x8D && a[lo+2] == 0x0D)
 							{
-								int rel = *(int*)(a + 0x0D);
-								g_dwmDeviceLock = (CRITICAL_SECTION*)(a + 0x11 + rel);
+								int rel = *(int*)(a + lo + 3);
+								g_dwmDeviceLock = (CRITICAL_SECTION*)(a + lo + 7 + rel);
 							}
-							// call rel32 at +0x47 -> std::vector<DeviceInfo>::erase, the exact
-							// moment a device is removed. Derived from the body, so no per-build
-							// address is needed (the deadline offset this replaces is NOT stable).
-							const int ec = g_activeDwmProfile->eraseCallOffset;
-							if (ec > 0 && a[ec] == 0xE8)
+							// The call rel32 at eraseCallOffset -> the device-removal function to hook.
+							// Both teardown paths use this; they differ only in the target:
+							//   EraseHook: the call is to std::vector<DeviceInfo>::erase.
+							//   DeleteUnusedDevicesEntry: the erase is inlined, and the call at this offset
+							//   is to the per-DeviceInfo destroy helper the inlined loop uses (every call
+							//   site of which is a device being destroyed). Either way it fires only on a
+							//   real removal, which is why it is hooked instead of DeleteUnusedDevices itself.
 							{
-								int rel = *(int*)(a + ec + 1);
-								CDeviceManager_DeviceInfoErase_orig =
-									(CDeviceManager_DeviceInfoErase_t*)(a + ec + 5 + rel);
+								const int ec = g_activeDwmProfile->eraseCallOffset;
+								if (ec > 0 && a[ec] == 0xE8)
+								{
+									int rel = *(int*)(a + ec + 1);
+									CDeviceManager_DeviceInfoErase_orig =
+										(CDeviceManager_DeviceInfoErase_t*)(a + ec + 5 + rel);
+								}
 							}
 							break;
 						}
@@ -2581,30 +2683,37 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				}
 				if (CDeviceManager_DeleteUnusedDevices_orig)
 				{
-					// The load-bearing hook. vector<DeviceInfo>::erase is the ONLY path by which a
-					// device is removed, and at its entry the CD3DDevice is still alive - so releasing
-					// there is correctly timed by construction, with no threshold and no sensitivity to
-					// compositing rate. Its address is derived from the call at eraseCallOffset.
+					// Device-removal hook. Both teardown paths install the SAME hook on the function that
+					// actually removes a device - it fires only on a genuine removal, never per idle frame,
+					// and sits directly above CD3DDevice::Release. The two paths differ only in WHICH
+					// function that is, and that is already encoded by eraseCallOffset (resolved above):
+					//   EraseHook (8246..9168): the standalone std::vector<DeviceInfo>::erase.
+					//   DeleteUnusedDevicesEntry (9278+): the erase is inlined, so the real removal is the
+					//     per-DeviceInfo destroy helper that inlined loop calls (every call site of it is a
+					//     device being destroyed).
+					// Hooking the removal function - not DeleteUnusedDevices itself - is essential: the latter
+					// runs every composited frame and usually removes nothing, so releasing there destroyed
+					// and rebuilt our assets every frame (a shader-compile/LUT-upload storm that showed up as
+					// heavy lag while dragging windows).
 					if (CDeviceManager_DeviceInfoErase_orig)
 					{
 						MH_CreateHook((PVOID)CDeviceManager_DeviceInfoErase_orig,
 						              (PVOID)CDeviceManager_DeviceInfoErase_hook,
 						              (PVOID*)&CDeviceManager_DeviceInfoErase_orig);
-						diag_log("hooked vector<DeviceInfo>::erase (exact device-removal point)");
+						diag_log("hooked device-removal function (exact per-device teardown point)");
 					}
 					else {
-						diag_log("FAILED to resolve vector<DeviceInfo>::erase - device teardown is UNPROTECTED");
+						diag_log("FAILED to resolve device-removal function - device teardown is UNPROTECTED");
 					}
 
 #if DIAG_MONITOR_MATCH
-					// Diagnostic only. This one samples DWM's device vector under DWM's own lock on
-					// every composited frame, which a release build has no reason to pay for: the
-					// erase hook above already does the actual work.
+					// Diagnostic only: the removal hook above does the real work. DeleteUnusedDevices is
+					// hooked here purely to log the device-vector state each frame. Never hooked in release.
 					MH_CreateHook((PVOID)CDeviceManager_DeleteUnusedDevices_orig,
 					              (PVOID)CDeviceManager_DeleteUnusedDevices_hook,
 					              (PVOID*)&CDeviceManager_DeleteUnusedDevices_orig);
-					diag_log(g_dwmDeviceLock ? "hooked CDeviceManager::DeleteUnusedDevices (device lock resolved)"
-					                         : "hooked CDeviceManager::DeleteUnusedDevices (NO device lock - reads unlocked)");
+					diag_log(g_dwmDeviceLock ? "hooked CDeviceManager::DeleteUnusedDevices (diagnostic; device lock resolved)"
+					                         : "hooked CDeviceManager::DeleteUnusedDevices (diagnostic; NO device lock)");
 #endif
 				}
 				else {

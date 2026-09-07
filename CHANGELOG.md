@@ -3,7 +3,27 @@
 ## Note on environment tuning
 
 Since the switch to the Windows 11 Germanium Platform, DWM internals got updated and [lauralex/dwm_lut](https://github.com/lauralex/dwm_lut) was not working anymore. As for [ed1ii/dwm_lut_fixed](https://github.com/ed1ii/dwm_lut_fixed) it was developed to bring support up to 25H2 (Canary), but newer 25H2 builds broke DwmLut again.  
-This version of DwmLut is tuned for `dwmcore.dll` **10.0.26100.8246**, **10.0.26100.8655**, **10.0.26100.8875** (Windows 11 25H2, builds 26200.8246 / 8655 / 8875) and **10.0.26100.8935** (Windows 11 26H2 preview, OS build 26300), ImageBase `0x180000000`. All signatures/offsets are valid for those binaries, thus the tool is not guaranteed to work on older 25H2 builds for which LUT application is skipped entirely as a safety measure. Windows 11 21H2 (22000) is now hardware-validated as well; the remaining legacy versions have been kept but not evaluated.
+This version of DwmLut is tuned for the `dwmcore.dll` builds listed in [SUPPORTED_VERSIONS.txt](SUPPORTED_VERSIONS.txt), ImageBase `0x180000000`. All signatures/offsets are valid for those binaries, thus the tool is not guaranteed to work on 25H2 builds prior 26200.8246 for which LUT application is skipped entirely as a safety measure. Support for remaining legacy versions has been kept but not evaluated.
+
+---
+---
+
+## v1.2.3
+
+### New build profiles
+- **`10.0.26100.9168`** (Windows 11 25H2). Signatures and context layout identical to 8935; only the device-vector globals moved.
+- **`10.0.26100.9278`** (Windows 11 25H2). `Present`, `IsCandidateDirectFlipCompatible` and `ProcessDeviceLost` still match uniquely and the clip box stays at `0x7648` (verified on a 2-monitor setup, origins `(0,0)` and `(-3840,-293)` both read correctly). Its `CDeviceManager::DeleteUnusedDevices` was recompiled: a larger register-save prologue moved the device-lock reference, and — the significant change — the `std::vector<DeviceInfo>::erase` call was **inlined**, so there is no standalone erase function to hook.
+
+### Device-teardown mechanism is now per-profile (`TeardownPath`)
+- **Was:** the release that keeps `dwm.exe` alive across a device removal always hooked a standalone `std::vector<DeviceInfo>::erase`, located from a fixed `call` offset inside `DeleteUnusedDevices`, with the device-lock reference at a fixed offset too.
+- **Is:** each profile now carries a `TeardownPath` selector and a `deviceLockLeaOffset`:
+  - `EraseHook` (8246 / 8655 / 8875 / 8935 / 9168) — the original path, unchanged: hook the standalone `vector<DeviceInfo>::erase`.
+  - `DeleteUnusedDevicesEntry` (9278) — the erase is inlined, so the engine hooks the **per-`DeviceInfo` destroy helper** the inlined loop calls once per removed device instead. Every call site of that helper is a device being destroyed, so it fires only on a genuine removal — exactly like the standalone erase on the other builds.
+- Both paths hook the **removal function**, never `DeleteUnusedDevices` itself. That distinction matters: `DeleteUnusedDevices` runs every composited frame and usually removes nothing, so releasing there would destroy and rebuild LUT assets every frame — a shader-compile/upload storm that manifests as heavy lag while dragging windows. Hooking the removal function fires only on an actual teardown.
+- Adding a future build with yet another removal shape now means adding one `TeardownPath` enumerator and its handling, then assigning it to the profiles that need it — no change to the builds already covered.
+
+### Notes
+- The device-lock reference offset inside `DeleteUnusedDevices` (`deviceLockLeaOffset`) is now a per-profile value — `0x0A` on the older builds, `0x18` on 9278 — where it was previously a fixed constant.
 
 ---
 ---
@@ -360,4 +380,4 @@ Windows composites SDR content into the HDR (scRGB) space using the **piecewise 
 
 ---
 
-*Last Updated: 5 August 2026*
+*Last Updated: 7 September 2026*

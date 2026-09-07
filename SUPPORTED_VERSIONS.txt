@@ -1,0 +1,15 @@
+DwmLut Is Back — Supported dwmcore.dll versions
+================================================
+
+Fully supported (signatures/offsets verified; LUT application tested):
+10.0.26100.8246    Windows 11 25H2            OS build 26200.8246
+10.0.26100.8655    Windows 11 25H2            OS build 26200.8655
+10.0.26100.8875    Windows 11 25H2            OS build 26200.8875
+10.0.26100.9168    Windows 11 25H2            OS build 26200.9168
+10.0.26100.9278    Windows 11 25H2            OS build 26200.9278
+10.0.26100.8935    Windows 11 26H2 preview    OS build 26300.8935
+
+Hardware-validated (separate legacy tier):
+10.0.22000.1880    Windows 11 21H2            OS build 22000.1880
+
+Last updated: 7 September 2026
