@@ -8,6 +8,14 @@ This version of DwmLut is tuned for the `dwmcore.dll` builds listed in [SUPPORTE
 ---
 ---
 
+## Unreleased
+
+### New build profiles
+- **`10.0.26100.9818`** (Windows 11 26H2, OS build 26300.9818). `COverlayContext::Present` was recompiled, so its signature no longer matched and the DLL failed to load. `DeleteUnusedDevices` has a new prologue (device-lock `lea` at `+0x09`) and `std::vector<DeviceInfo>::erase` is standalone again (call at `+0x46`), so this build uses `TeardownPath::EraseHook`. The clip box stays at `0x7648`. Tested on a 2-monitor setup, including fullscreen and monitor disconnect/reconnect.
+
+---
+---
+
 ## v1.2.3
 
 ### New build profiles
