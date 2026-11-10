@@ -15,7 +15,7 @@ The core engine is a dynamic link library (`lutdwm.dll`) designed for injection 
 - **LUT Application**: Uses a custom pixel shader to apply 3D LUT data via tetrahedral interpolation.
 - **Dithering**: Implements blue-noise dithering for SDR display modes to maintain bit-depth integrity.
 - **Multi-GPU / Multi-Monitor**: Isolates rendering resources per graphics adapter and per output, and validates every bound resource against the presenting device to keep hybrid iGPU/dGPU setups stable.
-- **Windows Version Handling**: Contains version-detection scaffolding for Windows 10 / Windows 11 (21H2 / 22H2 / 23H2 / 24H2 / 25H2 / 26H2); the active per-monitor coordinate logic is tuned to the 25H2 and 26H2-preview layouts of the builds listed in [SUPPORTED_VERSIONS.txt](SUPPORTED_VERSIONS.txt). The 21H2 tier is hardware-validated.
+- **Windows Version Handling**: Contains version-detection scaffolding for Windows 10 / Windows 11 (21H2 / 22H2 / 23H2 / 24H2 / 25H2 / 26H2); the active per-monitor coordinate logic is tuned to the 25H2 and 26H2 layouts of the builds listed in [SUPPORTED_VERSIONS.txt](SUPPORTED_VERSIONS.txt). The 21H2 tier is hardware-validated.
 
 #### Core Files:
 - `lutdwm/dllmain.cpp`: Main entry point, hooking logic, resource management, and shaders.
