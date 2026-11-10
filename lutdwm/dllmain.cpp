@@ -437,7 +437,7 @@ enum class TeardownPath
 {
 	// A standalone std::vector<DeviceInfo>::erase exists and is the sole device-removal call. The
 	// engine hooks it directly, via the call at eraseCallOffset inside DeleteUnusedDevices. Builds
-	// 26100.8246 through 26100.9168.
+	// 26100.8246 through 26100.9168, and 26100.9818.
 	EraseHook,
 
 	// std::vector<DeviceInfo>::erase is INLINED into CDeviceManager::DeleteUnusedDevices, so there is
@@ -445,7 +445,7 @@ enum class TeardownPath
 	// per removed device, so the engine hooks THAT (its address comes from the call at eraseCallOffset,
 	// same as EraseHook - only the target function differs). It fires only on a genuine removal, which
 	// is essential: hooking DeleteUnusedDevices itself would fire every composited frame and thrash
-	// assets. The name is kept for the profile/version mapping. Build 26100.9278+.
+	// assets. The name is kept for the profile/version mapping. Builds 26100.9278 / 9549.
 	DeleteUnusedDevicesEntry,
 };
 
@@ -491,21 +491,50 @@ struct DwmProfile
 static const DwmProfile g_dwmProfiles[] = {
 	// --- add newer dwmcore builds ABOVE (most-recent first) ---
 
-	// Windows 11 26H2 (OS build 26300) - dwmcore 10.0.26100.9818
-	// COverlayContext::Present was recompiled: smaller frame (sub rsp,0x98) and different register
-	// allocation (r13 / rdi), so its signature no longer matched and the DLL refused to load. Same 7
-	// arguments, and vt[24] / vt2[19] are still GetPhysicalBackBuffer / GetD3D11Resource.
-	// DeleteUnusedDevices has a new prologue too (device-lock lea at +0x09) and vector<DeviceInfo>::erase
-	// is a standalone function again (call at +0x46), so this build goes back to TeardownPath::EraseHook.
-	// Clip box NOT directly referenced by code: 0x7648 is kept because the neighbouring members (0x7638,
-	// 0x7678, 0x7680) and CalcDesktopClip's offsets are unchanged from 9278. Verified on a 2-monitor setup.
+	// Windows 11 25H2 (OS 26200.9818) - dwmcore 10.0.26100.9818
+	// Statically checked against the supplied x64 binary; live validation pending.
+	// Present and DeleteUnusedDevices require new signatures. The latter now calls a
+	// standalone vector erase again; the existing three-argument removal hook handles it.
+	// Desktop clip box remains 0x7648; backbuffer getter slots remain 24 -> 19.
 	{
 		DWM_VER(26100, 9818),
 		{   // AOB signatures (inline)
+			// COverlayContext::Present (9818 stack allocation and register assignments)
+			{ 0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x6C,
+			  0x24, 0xF9, 0x48, 0x81, 0xEC, 0x98, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x05, '?', '?', '?', '?',
+			  0x48, 0x33, 0xC4, 0x48, 0x89, 0x45, 0xEF, 0x4C, 0x8B, 0x6D, '?', 0x48, 0x8B, 0xF9 }, 46,
+			// COverlayContext::OverlaysEnabled (unchanged)
+			{ 0x83, 0x3D, '?', '?', '?', '?', 0x05, 0x74, 0x09, 0x83, 0x79, 0x28, 0x01, 0x0F, 0x97, 0xC0,
+			  0xC3 }, 17,
+			// COverlayContext::IsCandidateDirectFlipCompatible (unchanged)
+			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x68, 0x10, 0x48, 0x89, 0x70, 0x18, 0x48,
+			  0x89, 0x78, 0x20, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x20, 0x33, 0xDB }, 27,
+			// CDeviceManager::ProcessDeviceLost (identification only; unchanged)
+			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x48, 0x08, 0x56,
+			  0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x40, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0x0D, '?', '?', '?',
+			  '?' }, 33,
+			// CDeviceManager::DeleteUnusedDevices (9818: lock LEA +0x09, standalone erase call +0x46)
+			{ 0x48, 0x89, 0x4C, 0x24, 0x08, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x8D, 0x0D, '?', '?', '?', '?',
+			  0x48, 0xFF, 0x15, '?', '?', '?', '?', 0x0F, 0x1F, 0x44, 0x00, 0x00, 0x4C, 0x8B, 0x05, '?',
+			  '?', '?', '?', 0x32, 0xD2 }, 37,
+		},
+		0x7648, 0x44CFC8, 0x44CFD0, 0x10, 0x458, 0x08, 0x46,  // clipBox, vecFirst, vecLast, stride, flag, refcnt, eraseCall
+		TeardownPath::EraseHook, 0x09,              // standalone vector erase; deviceLockLeaOffset
+		true                                       // overlaysEnabledThunk
+	},
+
+	// Windows 11 25H2 (OS 26200.9549) - dwmcore 10.0.26100.9549
+	// Statically checked against the supplied x64 binary; live validation pending.
+	// All five 9278 signatures still match uniquely. Desktop clip box remains 0x7648;
+	// the lock LEA (+0x18) and DeviceInfo destroy call (+0x9E) are unchanged.
+	// Only the diagnostic device-vector globals moved, to 0x411E68 / 0x411E70.
+	{
+		DWM_VER(26100, 9549),
+		{   // AOB signatures (inline)
 			// COverlayContext::Present
 			{ 0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x6C,
-			  0x24, 0xF9, 0x48, 0x81, 0xEC, 0x98, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x05,
-			  '?', '?', '?', '?', 0x48, 0x33, 0xC4, 0x48, 0x89, 0x45, 0xEF, 0x4C, 0x8B, 0x6D, '?', 0x48, 0x8B, 0xF9 }, 46,
+			  0x24, 0xF9, 0x48, 0x81, 0xEC, 0xF8, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x05,
+			  '?', '?', '?', '?', 0x48, 0x33, 0xC4, 0x48, 0x89, 0x45, 0xEF, 0x4C, 0x8B, 0x65, '?', 0x48, 0x8B, 0xD9 }, 46,
 			// COverlayContext::OverlaysEnabled
 			{ 0x83, 0x3D, '?', '?', '?', '?', 0x05, 0x74, 0x09, 0x83, 0x79, 0x28, 0x01, 0x0F, 0x97, 0xC0, 0xC3 }, 17,
 			// COverlayContext::IsCandidateDirectFlipCompatible
@@ -514,13 +543,14 @@ static const DwmProfile g_dwmProfiles[] = {
 			// CDeviceManager::ProcessDeviceLost (prologue ends in a build-specific lea rcx,[rip+rel32], wildcarded)
 			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x48, 0x08, 0x56,
 			  0x57, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x40, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0x0D, '?', '?', '?', '?' }, 33,
-			// CDeviceManager::DeleteUnusedDevices (26100.9818: sub rsp,0x28 with no push rbx, lea rcx,[rip+?] at +0x09)
-			{ 0x48, 0x89, 0x4C, 0x24, 0x08, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x8D, 0x0D,
-			  '?', '?', '?', '?', 0x48, 0xFF, 0x15, '?', '?', '?', '?', 0x0F, 0x1F, 0x44, 0x00, 0x00,
-			  0x4C, 0x8B, 0x05, '?', '?', '?', '?', 0x32, 0xD2 }, 37,
+			// CDeviceManager::DeleteUnusedDevices (26100.9549: saves rbx/rbp/rsi/rcx + push rdi + sub, then
+			// lea rcx,[rip+?] at +0x18. Erase is INLINED; the per-DeviceInfo destroy call at +0x9E is
+			// hooked instead -- see teardownPath / eraseCallOffset below.)
+			{ 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x70, 0x20,
+			  0x48, 0x89, 0x48, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8D, 0x0D }, 27,
 		},
-		0x7648, 0x44CFC8, 0x44CFD0, 0x10, 0x458, 0x08, 0x46,  // clipBox, vecFirst, vecLast, stride, flag, refcnt, eraseCall
-		TeardownPath::EraseHook, 0x09,             // teardownPath, deviceLockLeaOffset
+		0x7648, 0x411E68, 0x411E70, 0x10, 0x458, 0x08, 0x9E,  // clipBox, vecFirst, vecLast, stride, flag, refcnt, eraseCall(-> inlined-loop's per-DeviceInfo destroy call)
+		TeardownPath::DeleteUnusedDevicesEntry, 0x18,  // teardownPath, deviceLockLeaOffset
 		true                                       // overlaysEnabledThunk (hook OverlaysEnabled via asm thunk)
 	},
 
@@ -2720,8 +2750,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 					// actually removes a device - it fires only on a genuine removal, never per idle frame,
 					// and sits directly above CD3DDevice::Release. The two paths differ only in WHICH
 					// function that is, and that is already encoded by eraseCallOffset (resolved above):
-					//   EraseHook (8246..9168): the standalone std::vector<DeviceInfo>::erase.
-					//   DeleteUnusedDevicesEntry (9278+): the erase is inlined, so the real removal is the
+					//   EraseHook (8246..9168, 9818): the standalone std::vector<DeviceInfo>::erase.
+					//   DeleteUnusedDevicesEntry (9278 / 9549): the erase is inlined, so the real removal is the
 					//     per-DeviceInfo destroy helper that inlined loop calls (every call site of it is a
 					//     device being destroyed).
 					// Hooking the removal function - not DeleteUnusedDevices itself - is essential: the latter

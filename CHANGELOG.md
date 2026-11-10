@@ -8,10 +8,21 @@ This version of DwmLut is tuned for the `dwmcore.dll` builds listed in [SUPPORTE
 ---
 ---
 
-## Unreleased
+## v1.2.4
 
-### New build profiles
-- **`10.0.26100.9818`** (Windows 11 26H2, OS build 26300.9818). `COverlayContext::Present` was recompiled, so its signature no longer matched and the DLL failed to load. `DeleteUnusedDevices` has a new prologue (device-lock `lea` at `+0x09`) and `std::vector<DeviceInfo>::erase` is standalone again (call at `+0x46`), so this build uses `TeardownPath::EraseHook`. The clip box stays at `0x7648`. Tested on a 2-monitor setup, including fullscreen and monitor disconnect/reconnect.
+### C++ injector — `lutdwm/dllmain.cpp`
+
+#### Windows 11 25H2 — 9549 profile
+
+- Added `DWM_VER(26100, 9549)` for `dwmcore.dll` **10.0.26100.9549**, supplied from Windows OS build **26200.9549**.
+- Updated the diagnostic device-vector RVAs to **`0x411E68` / `0x411E70`**.
+
+#### Windows 11 26H2 — 9818 profile
+
+- Added `DWM_VER(26100, 9818)` for `dwmcore.dll` **10.0.26100.9818**, supplied from Windows OS build **26300.9818**.
+- Replaced the `Present` AOB signature with a new **46-byte** pattern and the `DeleteUnusedDevices` signature with a new **37-byte** pattern. The previous patterns do not match this binary.
+- Device removal uses a **standalone `vector<DeviceInfo>::erase` again**. The profile uses `TeardownPath::EraseHook`, with `eraseCallOffset=0x46` and `deviceLockLeaOffset=0x09`.
+- Updated the diagnostic device-vector RVAs to **`0x44CFC8` / `0x44CFD0`**.
 
 ---
 ---
@@ -388,4 +399,4 @@ Windows composites SDR content into the HDR (scRGB) space using the **piecewise 
 
 ---
 
-*Last Updated: 7 September 2026*
+*Last updated: 9 November 2026*
