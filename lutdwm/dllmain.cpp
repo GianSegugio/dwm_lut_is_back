@@ -30,6 +30,21 @@
 // Temporary diagnostic: 1 = log loaded LUTs and per-context origin resolution to
 // C:\Windows\Temp\dwm_diag.log (via diag_log, below). Set back to 0 for production builds.
 #define DIAG_MONITOR_MATCH 0
+// Temporary diagnostic: 1 = per-frame Present logging (surface desc, rect list, LUT/scratch/RTV
+// state) to C:\Windows\Temp\dwm_diag.log. For the DLDSR corruption investigation build only;
+// MUST be 0 for production builds (per-frame file I/O inside the Present hook).
+#define DIAG_PER_FRAME 0
+
+// Composition-forcing mechanisms (FINAL PRODUCTION CONFIGURATION).
+//
+// KEEP_OVERLAY_TEST_MODE_FORCE must stay 0: forcing the global OverlayTestMode to 5 is what made
+// a DLDSR (render resolution > desktop) borderless fullscreen surface corrupt on Alt-Tab return
+// (verified by experiment matrix: with the global forced -> corruption; without -> none, while the
+// per-context hooks alone keep both the LUT working and the desktop stable). DWM's own overlay
+// configuration code is left untouched; the per-context hooks below are enough to keep the LUT
+// applied over composited fullscreen surfaces without the global side effect.
+#define KEEP_OVERLAY_TEST_MODE_FORCE 0
+#define KEEP_CONTEXT_FLIP_SUPPRESSION 1
 
 #ifdef _DEBUG
 #define DEBUG_MODE true
@@ -122,8 +137,8 @@ using Microsoft::WRL::ComPtr;
 // Always-compiled, crash-proof diagnostic log (SYSTEM-writable). Called only on rare events.
 static void diag_log(const char* msg)
 {
-#if !DIAG_MONITOR_MATCH
-	return;   // logging disabled in production; set DIAG_MONITOR_MATCH=1 to enable dwm_diag.log
+#if !DIAG_MONITOR_MATCH && !DIAG_PER_FRAME
+	return;   // logging disabled in production; set DIAG_MONITOR_MATCH/DIAG_PER_FRAME to enable dwm_diag.log
 #endif
 	// Milliseconds since this DLL attached. Ordering alone cannot tell us how our idle threshold
 	// compares with DWM's own erase deadline - that needs elapsed time, especially under power
@@ -139,6 +154,27 @@ static void diag_log(const char* msg)
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+
+#if DIAG_PER_FRAME
+// Throttled reason logger (DIAG_PER_FRAME builds only): at most one line per tag per 250 ms, so a
+// permanently failing gate cannot spam the log while still showing WHEN the failure started.
+static void DiagReason(const char* tag, const char* msg, void* a1 = nullptr, unsigned long long v1 = 0)
+{
+	static unsigned long long last[16];
+	static const char* lastTag[16] = {};
+	unsigned int slot = 0;
+	for (; slot < 16; slot++) if (!lastTag[slot] || strcmp(lastTag[slot], tag) == 0) break;
+	if (slot == 16) slot = 0;
+	lastTag[slot] = tag;
+	const unsigned long long now = GetTickCount64();
+	if (now - last[slot] < 250 && last[slot] != 0) return;
+	last[slot] = now;
+	char b[384];
+	if (a1) snprintf(b, sizeof(b), "[%s] %s a1=%p v1=%llu", tag, msg, a1, v1);
+	else    snprintf(b, sizeof(b), "[%s] %s v1=%llu", tag, msg, v1);
+	diag_log(b);
+}
+#endif
 
 // Once set, every hook body returns immediately -> DWM composites normally, never crashes.
 static std::atomic<bool> g_hookInert{false};
@@ -246,9 +282,26 @@ struct OutputRes {
 	struct RtvEntry { ID3D11Texture2D* key = nullptr; ComPtr<ID3D11RenderTargetView> rtv; };
 	RtvEntry rtvCache[8];
 	int rtvCount = 0;
-	int lastLutSize[2] = {-1, -1};
+	// State actually written to the SHARED constant buffer ({lutSize, hdr}). The buffer is shared by
+	// the SDR (index 0) and HDR (index 1) draw paths, so per-slot "last written" bookkeeping (the old
+	// lastLutSize[2]) leaves the hdr flag stale on the second mode switch whenever the SDR and HDR
+	// LUTs have the same size (the normal case): boot-HDR -> SDR -> HDR rendered the HDR surface with
+	// the SDR (hdr=false) shader path, feeding linear scRGB values (which exceed 1.0 for HDR
+	// highlights) straight through a 0..1 SDR LUT -> severe overexposure. Track what the BUFFER
+	// holds, not each slot's history.
+	int  lastCbLutSize = -1;
+	bool lastCbHdr = false;
 	int sightings = 0;                            // transient-plane debounce
 	std::atomic<bool> ready{false};
+
+	// Idle-sweep bookkeeping. `refs` counts in-flight RenderLUT users: FindOrRequestOutput AddRefs
+	// under g_outputsMutex before handing the pointer out, and every exit path of RenderLUT Releases,
+	// so an eviction can never free an output that a present is still drawing with. `lastUseTick` is
+	// GetTickCount64() at the last use, stamped while the user holds the entry's reference.
+	std::atomic<long> refs{0};
+	unsigned long long lastUseTick = 0;
+	void AddRef() { refs.fetch_add(1, std::memory_order_relaxed); }
+	void Release() { refs.fetch_sub(1, std::memory_order_relaxed); }
 
 	// Identity of the layout these caches were built for. A COverlayContext pointer is NOT identity:
 	// DWM keeps using it across a display topology change, and the same pointer has been observed
@@ -763,14 +816,19 @@ static int  g_overlayTestModeOriginal = 0;
 static std::atomic<bool> g_overlayTestModeSaved{false};
 
 // Force MPO off so DWM composites (which is what lets the LUT apply at all), remembering the value we
-// found the first time round.
+// found the first time round. Disabled when KEEP_OVERLAY_TEST_MODE_FORCE=0 (diagnostic experiments:
+// leave DWM's flip/overlay decisions untouched and see whether the DLDSR Alt-Tab corruption remains).
 static void ForceOverlayTestMode()
 {
+#if KEEP_OVERLAY_TEST_MODE_FORCE
 	if (g_pOverlayTestMode == NULL) return;
 	bool expected = false;
 	if (g_overlayTestModeSaved.compare_exchange_strong(expected, true))
 		g_overlayTestModeOriginal = *g_pOverlayTestMode;
 	*g_pOverlayTestMode = 5;
+#else
+	(void)0;
+#endif
 }
 
 // Put back exactly what DWM had. A no-op if we never wrote it, so we can never invent a value.
@@ -1356,7 +1414,8 @@ static void BuildOutputRes(OutputRes* o, ID3D11Device* dev, int index, UINT w, U
 	{
 		for (int i = 0; i < o->rtvCount; i++) { o->rtvCache[i].rtv.Reset(); o->rtvCache[i].key = nullptr; }
 		o->rtvCount = 0;
-		for (int i = 0; i < 2; i++) { o->scratch[i].Reset(); o->scratchSrv[i].Reset(); o->scratchDesc[i] = {}; o->lastLutSize[i] = -1; }
+		for (int i = 0; i < 2; i++) { o->scratch[i].Reset(); o->scratchSrv[i].Reset(); o->scratchDesc[i] = {}; }
+		o->lastCbLutSize = -1; o->lastCbHdr = false;
 		o->ownerDevice = dev;
 
 		D3D11_BUFFER_DESC vb = {};
@@ -1417,6 +1476,37 @@ static bool BuildOutputRes_Guarded(OutputRes* o, ID3D11Device* dev, int index, U
 	__except (EXCEPTION_EXECUTE_HANDLER) { diag_log("SEH during output build -> skip frame"); return false; }
 }
 
+// RAII release of the in-flight reference FindOrRequestOutput takes. Must live on every exit path of
+// RenderLUT after the fetch, so the idle sweep can never delete an output that is mid-draw.
+struct OutputResRef
+{
+	OutputRes* o;
+	explicit OutputResRef(OutputRes* p) : o(p) {}
+	~OutputResRef() { if (o) o->Release(); }
+};
+
+// Reclaims OutputRes entries DWM has abandoned. DWM recreates its COverlayContext objects across
+// display transitions (notably when a scaled/borderless fullscreen surface is re-activated after an
+// Alt-Tab, which on some driver paths churns context pointers per cycle); every abandoned context
+// used to leave its two scratch textures (~74 MB at 4K) pinned forever in dwm.exe. Repeated cycles
+// then grew dwm memory without bound - matching the reported progressive worsening into a near-black
+// screen / system freeze. Rebuilding a reclaimed output is cheap (one texture + two buffers), so the
+// idle window is conservative. Only entries with refs==0 are touched; the caller holds g_outputsMutex.
+static void SweepIdleOutputs(unsigned long long now)
+{
+	const unsigned long long idleMs = 30000;
+	for (auto it = g_outputs.begin(); it != g_outputs.end();)
+	{
+		OutputRes* e = it->second;
+		if (e->refs.load(std::memory_order_acquire) == 0 && now - e->lastUseTick > idleMs)
+		{
+			delete e;
+			it = g_outputs.erase(it);
+		}
+		else ++it;
+	}
+}
+
 static AdapterAssets* FindOrRequestAdapter(ID3D11Device* dev)
 {
 	std::lock_guard<std::mutex> lk(g_adaptersMutex);
@@ -1444,16 +1534,30 @@ static OutputRes* FindOrRequestOutput(void* self, ID3D11Device* dev, int index, 
 	std::lock_guard<std::mutex> lk(g_outputsMutex);
 	OutputRes* o;
 	auto it = g_outputs.find(self);
-	if (it == g_outputs.end()) { o = new OutputRes(); g_outputs[self] = o; }
+	if (it == g_outputs.end())
+	{
+		// The map is keyed on the raw COverlayContext pointer, which is NOT identity across a display
+		// transition. Bound it so churned contexts (Alt-Tab through a scaled fullscreen surface) cannot
+		// grow dwm.exe memory without limit; the sweep only reclaims entries no present is using.
+		if (g_outputs.size() >= 16)
+			SweepIdleOutputs(GetTickCount64());
+		o = new OutputRes();
+		g_outputs[self] = o;
+	}
 	else o = it->second;
 
 	bool ok = o->ready.load() && o->ownerDevice.Get() == dev &&
 	          o->scratch[index] && o->scratchDesc[index].Width >= w &&
 	          o->scratchDesc[index].Height >= h && o->scratchDesc[index].Format == fmt;
-	if (ok) return o;
+	if (ok)
+	{
+		o->AddRef();   // in-flight reference; released by OutputResRef in RenderLUT
+		return o;
+	}
 
 	// Build synchronously on the present thread (create-once, cached). No deferral, no queue stall.
 	if (!BuildOutputRes_Guarded(o, dev, index, w, h, fmt)) { o->ready.store(false); return nullptr; }
+	o->AddRef();       // in-flight reference; released by OutputResRef in RenderLUT
 	return o->ready.load() ? o : nullptr;
 }
 
@@ -1525,11 +1629,41 @@ struct ContextBindingGuard
 bool RenderLUT(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects,
                AdapterAssets* a, ID3D11Device* dev)
 {
-	if (!a || !dev || !backBuffer) return false;
-	if (!ResourceOnDevice(backBuffer, dev)) return false; // cross-instance/adapter guard
+	if (!a || !dev || !backBuffer)
+	{
+#if DIAG_PER_FRAME
+		DiagReason("render", "bad-args", self, (unsigned long long)backBuffer);
+#endif
+		return false;
+	}
+	if (!ResourceOnDevice(backBuffer, dev))
+	{
+#if DIAG_PER_FRAME
+		DiagReason("render", "backbuffer-wrong-device", self, (unsigned long long)backBuffer);
+#endif
+		return false; // cross-instance/adapter guard
+	}
 
 	D3D11_TEXTURE2D_DESC bbDesc;
 	backBuffer->GetDesc(&bbDesc);
+
+	// A zero-sized surface would divide by zero in the vertex math below (NaN clip coordinates on the
+	// GPU); a multisampled surface cannot be copied with CopySubresourceRegion (needs Resolve) and the
+	// shader has no sample-index handling, so both are skipped rather than fed garbage to the driver.
+	if (bbDesc.Width == 0 || bbDesc.Height == 0)
+	{
+#if DIAG_PER_FRAME
+		DiagReason("render", "zero-size", self, ((unsigned long long)bbDesc.Width << 32) | bbDesc.Height);
+#endif
+		return false;
+	}
+	if (bbDesc.SampleDesc.Count > 1)
+	{
+#if DIAG_PER_FRAME
+		DiagReason("render", "msaa", self, bbDesc.SampleDesc.Count);
+#endif
+		return false;
+	}
 
 	int index = -1;
 	if (bbDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || bbDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
@@ -1540,25 +1674,81 @@ bool RenderLUT(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, i
 	{
 		index = 1;
 	}
-	if (index == -1) return false;
+	if (index == -1)
+	{
+#if DIAG_PER_FRAME
+		DiagReason("render", "unsupported-format", self, bbDesc.Format);
+#endif
+		return false;
+	}
 
 	int lutIdx = 0; lutData* lut;
 	int lutLeft = 0, lutTop = 0;   // always written when the lookup succeeds
-	if (!(lut = GetLUTDataFromCOverlayContext(self, index == 1, &lutIdx, &lutLeft, &lutTop))) return false;
+	if (!(lut = GetLUTDataFromCOverlayContext(self, index == 1, &lutIdx, &lutLeft, &lutTop)))
+	{
+#if DIAG_PER_FRAME
+		DiagReason("render", "no-lut-match", self, bbDesc.Format);
+#endif
+		return false;
+	}
 
-	if (lutIdx < 0 || lutIdx >= a->lutCount) return false;
+	if (lutIdx < 0 || lutIdx >= a->lutCount)
+	{
+#if DIAG_PER_FRAME
+		DiagReason("render", "lutidx-out-of-range", self, (unsigned long long)lutIdx);
+#endif
+		return false;
+	}
 	ID3D11ShaderResourceView* lutSrv = a->lutSrv[lutIdx].Get();
-	if (!lutSrv || !ResourceOnDevice(lutSrv, dev)) return false; // explicit: LUT texture belongs to this device
+	if (!lutSrv || !ResourceOnDevice(lutSrv, dev))
+	{
+#if DIAG_PER_FRAME
+		DiagReason("render", "lutsrv-bad", self, (unsigned long long)lutIdx);
+#endif
+		return false; // explicit: LUT texture belongs to this device
+	}
 
 	OutputRes* o = FindOrRequestOutput(self, dev, index, bbDesc.Width, bbDesc.Height, bbDesc.Format);
-	if (!o) return false; // building/not-ready -> skip this frame (NO allocation on render thread)
+	if (!o)
+	{
+#if DIAG_PER_FRAME
+		DiagReason("render", "output-unavailable", self, (unsigned long long)dev);
+#endif
+		return false; // building/not-ready -> skip this frame (NO allocation on render thread)
+	}
+	OutputResRef oref(o); // in-flight ref: the idle sweep must not free an output mid-draw
+	o->lastUseTick = GetTickCount64();
 
-	std::lock_guard<std::mutex> ctxLock(a->ctxMutex);
+	// NOTE: a->ctxMutex is held by RenderLUT_Guarded for the whole call (acquired before the SEH
+	// boundary, released after it), so a fault can never leak the lock. No lock_guard here.
 
 	// Re-validate everything under the lock; if anything is stale, bail (no inline build).
 	if (o->ownerDevice.Get() != dev || !o->scratch[index] || !o->scratchSrv[index] ||
-	    !o->vertexBuffer || !o->constantBuffer) return false;
-	if (!ResourceOnDevice(o->scratch[index].Get(), dev)) return false;
+	    !o->vertexBuffer || !o->constantBuffer)
+	{
+#if DIAG_PER_FRAME
+		DiagReason("render", "output-stale", self, (unsigned long long)dev);
+#endif
+		return false;
+	}
+	if (!ResourceOnDevice(o->scratch[index].Get(), dev))
+	{
+#if DIAG_PER_FRAME
+		DiagReason("render", "scratch-wrong-device", self, (unsigned long long)o->scratch[index].Get());
+#endif
+		return false;
+	}
+	// Defense in depth: the scratch must cover the current surface in size AND format, or the copy and
+	// the sampling UVs below would touch out-of-bounds memory on the GPU.
+	if (o->scratchDesc[index].Width < bbDesc.Width || o->scratchDesc[index].Height < bbDesc.Height ||
+	    o->scratchDesc[index].Format != bbDesc.Format)
+	{
+#if DIAG_PER_FRAME
+		DiagReason("render", "scratch-mismatch", self,
+			((unsigned long long)o->scratchDesc[index].Width << 32) | o->scratchDesc[index].Height);
+#endif
+		return false;
+	}
 
 	// The scratch texture is revalidated upstream against the current surface, but the render-target
 	// cache is keyed purely on a backbuffer pointer and survives a re-layout, pinning the old
@@ -1579,13 +1769,46 @@ bool RenderLUT(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, i
 	}
 
 	// RTV cache (tiny view objects; cached per backbuffer, evict-oldest).
+	//
+	// The cache is keyed on the RAW backbuffer POINTER, which is not identity: when DWM tears down and
+	// recreates a swapchain (e.g. a borderless surface re-activated after Alt-Tab), the new backbuffer
+	// object can land on the SAME address as the old one. The old RTV pins the OLD (dead) texture, so a
+	// naive hit would keep drawing the LUT onto a surface DWM no longer presents - and with a reused
+	// address, onto whatever content that memory now aliases, which is exactly the kind of stale-surface
+	// corruption seen after Alt-Tab cycles. Every hit therefore verifies the view's resource IS the
+	// current backbuffer; a mismatch is treated as a miss and the stale entry is dropped.
+	const char* rtvState = "fresh";
 	ID3D11RenderTargetView* rtv = nullptr;
 	for (int i = 0; i < o->rtvCount; i++)
-		if (o->rtvCache[i].key == backBuffer) { rtv = o->rtvCache[i].rtv.Get(); break; }
+	{
+		if (o->rtvCache[i].key != backBuffer) continue;
+		ComPtr<ID3D11Resource> res;
+		o->rtvCache[i].rtv->GetResource(&res);   // ID3D11View::GetResource is void; res is set or null
+		if (res.Get() == (ID3D11Resource*)backBuffer)
+		{
+			rtv = o->rtvCache[i].rtv.Get();
+			rtvState = "hit";
+		}
+		else
+		{
+			// Stale entry (address reused by a different texture): drop it (swap-with-last compaction).
+			o->rtvCache[i] = o->rtvCache[o->rtvCount - 1];
+			o->rtvCount--;
+			rtvState = "stale";
+			diag_log("rtv cache: stale entry for reused backbuffer pointer -> dropped");
+		}
+		break;
+	}
 	if (!rtv)
 	{
 		ComPtr<ID3D11RenderTargetView> newRtv;
-		if (FAILED(dev->CreateRenderTargetView(backBuffer, NULL, &newRtv))) return false;
+		if (FAILED(dev->CreateRenderTargetView(backBuffer, NULL, &newRtv)))
+		{
+#if DIAG_PER_FRAME
+			DiagReason("render", "CreateRTV-failed", self, (unsigned long long)backBuffer);
+#endif
+			return false;
+		}
 		if (o->rtvCount >= 8)
 		{
 			for (int i = 0; i < 7; i++) o->rtvCache[i] = o->rtvCache[i + 1];
@@ -1618,14 +1841,27 @@ bool RenderLUT(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, i
 	ctx->PSSetShaderResources(1, 1, &lutSrv);
 	ctx->PSSetShaderResources(2, 1, &srv2);
 
-	if (o->lastLutSize[index] != lut->size)
+	// Rewrite the buffer whenever its CONTENT would change (LUT size OR the hdr flag), never only on
+	// size: the buffer is shared by the SDR and HDR paths, so on a mode switch (surface format
+	// change) the hdr flag must be re-pushed even when both LUTs have the same size. Without this,
+	// SDR -> HDR left hdr=false in the buffer, the PQ/scRGB path was skipped, and the HDR picture
+	// came out severely overexposed until a re-Apply rebuilt the output state.
+	const bool isHdr = (index == 1);
+	if (o->lastCbLutSize != lut->size || o->lastCbHdr != isHdr)
 	{
-		int cdata[4] = { lut->size, index == 1, 0, 0 };
+		int cdata[4] = { lut->size, isHdr ? 1 : 0, 0, 0 };
 		D3D11_MAPPED_SUBRESOURCE mr;
-		if (FAILED(ctx->Map(o->constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mr))) return false;
+		if (FAILED(ctx->Map(o->constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mr)))
+		{
+#if DIAG_PER_FRAME
+			DiagReason("render", "MapCB-failed", self, (unsigned long long)o->constantBuffer.Get());
+#endif
+			return false;
+		}
 		memcpy(mr.pData, cdata, sizeof(cdata));
 		ctx->Unmap(o->constantBuffer.Get(), 0);
-		o->lastLutSize[index] = lut->size;
+		o->lastCbLutSize = lut->size;
+		o->lastCbHdr = isHdr;
 	}
 	ID3D11Buffer* cbuf = o->constantBuffer.Get();
 	ctx->PSSetConstantBuffers(0, 1, &cbuf);
@@ -1635,17 +1871,50 @@ bool RenderLUT(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, i
 	ctx->CopySubresourceRegion(o->scratch[index].Get(), 0, 0, 0, 0, backBuffer, 0, &box);
 
 	UINT stride = 4 * sizeof(float), offset = 0;
-	for (int i = 0; i < numRects; i++)
+	// DWM's dirty-rect list must be normalized, integer rectangles inside the surface. Anything else -
+	// stale vector contents, a torn or misread rect vector after a surface reactivation, or a
+	// coordinate-space mismatch on a scaled (DLDSR) surface - would otherwise turn into wildly wrong
+	// clip-space geometry and texture UVs, rasterizing as "duplicated / vertically compressed fragments
+	// and black patches". Clamping every rect into the surface keeps each draw inside the backbuffer,
+	// and degenerate rects are skipped (they legitimately mean "nothing to redraw"). The cap bounds the
+	// loop even if the element count itself is bogus. For correct input this is a no-op.
+	const int rectCap = 512;
+	const int n = numRects < rectCap ? numRects : rectCap;
+#if DIAG_PER_FRAME
 	{
-		tagRECT* rect = &rects[i];
+		char b[384];
+		snprintf(b, sizeof(b),
+			"[PR] bb=%ux%u scratch=%ux%u fmt=%d msaa=%u rtv=%s rtvCount=%d layout=(%d,%d,%u,%u) lutSize=%d n=%d",
+			bbDesc.Width, bbDesc.Height, o->scratchDesc[index].Width, o->scratchDesc[index].Height,
+			(int)bbDesc.Format, bbDesc.SampleDesc.Count, rtvState, o->rtvCount,
+			o->layoutLeft, o->layoutTop, o->layoutWidth, o->layoutHeight, lut->size, n);
+		diag_log(b);
+	}
+#endif
+	for (int i = 0; i < n; i++)
+	{
+		tagRECT r = rects[i];
+		if (r.right <= r.left || r.bottom <= r.top) continue;      // empty rect -> nothing to draw
+		if (r.left < 0) r.left = 0;                                 // clamp into the surface
+		if (r.top < 0) r.top = 0;
+		if (r.right > (LONG)bbDesc.Width) r.right = (LONG)bbDesc.Width;
+		if (r.bottom > (LONG)bbDesc.Height) r.bottom = (LONG)bbDesc.Height;
+		if (r.right <= r.left || r.bottom <= r.top) continue;      // fully outside after clamping
+
 		float bw = (float)bbDesc.Width, bh = (float)bbDesc.Height;
-		float l = rect->left / bw * 2 - 1, t = rect->top / bh * -2 + 1;
-		float r = rect->right / bw * 2 - 1, b = rect->bottom / bh * -2 + 1;
+		float l = r.left / bw * 2 - 1, t = r.top / bh * -2 + 1;
+		float rr = r.right / bw * 2 - 1, b = r.bottom / bh * -2 + 1;
 		float tw = (float)o->scratchDesc[index].Width, th = (float)o->scratchDesc[index].Height;
-		float tl = rect->left / tw, tt = rect->top / th, tr = rect->right / tw, tb = rect->bottom / th;
-		float vtx[] = { l, b, tl, tb,  l, t, tl, tt,  r, b, tr, tb,  r, t, tr, tt };
+		float tl = r.left / tw, tt = r.top / th, tr = r.right / tw, tb = r.bottom / th;
+		float vtx[] = { l, b, tl, tb,  l, t, tl, tt,  rr, b, tr, tb,  rr, t, tr, tt };
 		D3D11_MAPPED_SUBRESOURCE mr;
-		if (FAILED(ctx->Map(o->vertexBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mr))) return false;
+		if (FAILED(ctx->Map(o->vertexBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mr)))
+		{
+#if DIAG_PER_FRAME
+			DiagReason("render", "MapVB-failed", self, (unsigned long long)i);
+#endif
+			return false;
+		}
 		memcpy(mr.pData, vtx, sizeof(vtx));
 		ctx->Unmap(o->vertexBuffer.Get(), 0);
 		ID3D11Buffer* vb = o->vertexBuffer.Get();
@@ -1659,19 +1928,87 @@ bool RenderLUT(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, i
 // legal here (fixes C2712: ApplyLUT/ApplyLUTDirect own ComPtr locals and therefore cannot host __try).
 // On any SEH we latch the hook inert, so no later frame re-enters -- a lock held during a hardware
 // fault can never deadlock a subsequent present; DWM simply composites without the LUT this session.
+//
+// CRITICAL: SEH unwinds do NOT run C++ destructors. If RenderLUT took a->ctxMutex itself (lock_guard)
+// and bound our render state, a fault inside it would leave the mutex locked forever (freezing the
+// next present on that adapter) and our RTV/shader/sampler bindings live in DWM's immediate context
+// (corrupting whatever DWM presents next). The mutex is therefore acquired HERE, before the __try,
+// and both the normal path and the __except path unlock exactly once; the __except also unbinds our
+// render state manually and records the exception code/address for diagnostics.
+static int RenderLUTCrashFilter(unsigned int code, struct _EXCEPTION_POINTERS* ep, unsigned long long* outCode,
+                                unsigned long long* outAddr)
+{
+	*outCode = code;
+	*outAddr = (ep && ep->ExceptionRecord) ? (unsigned long long)ep->ExceptionRecord->ExceptionAddress : 0;
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
+#if DIAG_PER_FRAME
+// fopen-free crash logger: writes even if dwm_diag.log is locked (e.g. by an editor holding the file).
+static void DiagCrashLog(const char* msg)
+{
+	HANDLE h = CreateFileA(R"(C:\Windows\Temp\dwm_diag_crash.log)", FILE_APPEND_DATA,
+		FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h == INVALID_HANDLE_VALUE) return;
+	char line[512];
+	static const unsigned long long epoch = GetTickCount64();
+	snprintf(line, sizeof(line), "[%6llums] %s\n", GetTickCount64() - epoch, msg);
+	DWORD wrote = 0;
+	WriteFile(h, line, (DWORD)strlen(line), &wrote, NULL);
+	CloseHandle(h);
+}
+#else
+#define DiagCrashLog(msg) ((void)0)
+#endif
+
+static unsigned long long s_crashCode = 0;
+static unsigned long long s_crashAddr = 0;
+
 static bool RenderLUT_Guarded(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects,
                               AdapterAssets* a, ID3D11Device* dev)
 {
+	if (!a || !dev || !backBuffer) return false;
+	a->ctxMutex.lock();
+	bool ok = false;
 	__try
 	{
-		return RenderLUT(self, backBuffer, rects, numRects, a, dev);
+		ok = RenderLUT(self, backBuffer, rects, numRects, a, dev);
 	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
+	__except (RenderLUTCrashFilter(GetExceptionCode(), GetExceptionInformation(), &s_crashCode, &s_crashAddr))
 	{
-		diag_log("SEH inside RenderLUT -> latching hook inert");
+		char b[256];
+		snprintf(b, sizeof(b), "SEH inside RenderLUT code=0x%08X addr=%p -> latching hook inert; "
+			"ctxMutex released and render state unbound", (unsigned int)s_crashCode, (void*)s_crashAddr);
+		DiagCrashLog(b);
+		DiagCrashLog("RenderLUT faulted: unbinding DWM context state now");
+		// a->ctxMutex is still held by the faulted frame (lock_guard never ran its destructor).
+		// Unbind every slot we may have left bound, then release the mutex exactly once.
+		__try
+		{
+			ID3D11DeviceContext* ctx = a->context.Get();
+			if (ctx)
+			{
+				ID3D11RenderTargetView*   nullRtv[1] = { NULL };
+				ID3D11ShaderResourceView* nullSrv[3] = { NULL, NULL, NULL };
+				ID3D11SamplerState*       nullSmp[2] = { NULL, NULL };
+				ID3D11Buffer*             nullBuf[1] = { NULL };
+				UINT zeroStride[1] = { 0 }, zeroOffset[1] = { 0 };
+				ctx->OMSetRenderTargets(1, nullRtv, NULL);
+				ctx->PSSetShaderResources(0, 3, nullSrv);
+				ctx->PSSetSamplers(0, 2, nullSmp);
+				ctx->PSSetConstantBuffers(0, 1, nullBuf);
+				ctx->IASetVertexBuffers(0, 1, nullBuf, zeroStride, zeroOffset);
+				ctx->IASetInputLayout(NULL);
+				ctx->VSSetShader(NULL, NULL, 0);
+				ctx->PSSetShader(NULL, NULL, 0);
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
 		g_hookInert.store(true);
-		return false;
+		ok = false;
 	}
+	a->ctxMutex.unlock();
+	return ok;
 }
 
 // Untrusted-swapchain-safe device fetch. The Present-hook fallback scans DWM object memory for a
@@ -1752,20 +2089,102 @@ bool ApplyLUT(void* self, IDXGISwapChain* swapChain, struct tagRECT* rects, int 
 	return result;
 }
 
+// ---- per-frame diagnostic logging (DIAG_PER_FRAME build only; compiled to nothing otherwise) ----
+#if DIAG_PER_FRAME
+// Foreground-window change logger ("poor man's keylogger"): samples the foreground window at most
+// every 500 ms and logs class+pid on change, so Alt-Tab moments are visible in the log timeline.
+static void DiagForegroundWatch()
+{
+	static unsigned long long lastCheck = 0;
+	static HWND lastHwnd = NULL;
+	const unsigned long long now = GetTickCount64();
+	if (now - lastCheck < 500) return;
+	lastCheck = now;
+	HWND h = GetForegroundWindow();
+	if (h == lastHwnd) return;
+	lastHwnd = h;
+	char cls[64] = "?";
+	DWORD pid = 0;
+	if (h)
+	{
+		__try { GetClassNameA(h, cls, sizeof(cls)); GetWindowThreadProcessId(h, &pid); }
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+	char b[160];
+	snprintf(b, sizeof(b), "[FG] foreground=%p class=%s pid=%u", h, cls, (unsigned int)pid);
+	diag_log(b);
+}
+
+static void DiagLogPresent(void* self, void* overlaySwapChain, unsigned int a3, struct tagRECT* rects, int numRects,
+                           ID3D11Texture2D* bb, const D3D11_TEXTURE2D_DESC* d, int lutIdx, int lutLeft, int lutTop,
+                           bool applied)
+{
+	static const unsigned long long attachTick = GetTickCount64();
+	static unsigned long long lastLog = 0;
+	const unsigned long long now = GetTickCount64();
+	// Unthrottled for the first minute after attach (captures the Alt-Tab transition), then 200 ms.
+	if (now - attachTick > 60000 && now - lastLog < 200) return;
+	lastLog = now;
+
+	char b[512];
+	const int n = numRects < 4 ? numRects : 4;
+	snprintf(b, sizeof(b),
+		"[PF] self=%p sc=%p a3=%u n=%d r0=(%d,%d,%d,%d) r1=(%d,%d,%d,%d) r2=(%d,%d,%d,%d) r3=(%d,%d,%d,%d) "
+		"bb=%p %ux%u fmt=%d msaa=%u lut=%d @(%d,%d) ok=%d",
+		self, overlaySwapChain, a3, numRects,
+		n > 0 ? rects[0].left : 0, n > 0 ? rects[0].top : 0, n > 0 ? rects[0].right : 0, n > 0 ? rects[0].bottom : 0,
+		n > 1 ? rects[1].left : 0, n > 1 ? rects[1].top : 0, n > 1 ? rects[1].right : 0, n > 1 ? rects[1].bottom : 0,
+		n > 2 ? rects[2].left : 0, n > 2 ? rects[2].top : 0, n > 2 ? rects[2].right : 0, n > 2 ? rects[2].bottom : 0,
+		n > 3 ? rects[3].left : 0, n > 3 ? rects[3].top : 0, n > 3 ? rects[3].right : 0, n > 3 ? rects[3].bottom : 0,
+		bb, d ? d->Width : 0, d ? d->Height : 0, d ? (int)d->Format : -1, d ? d->SampleDesc.Count : 0,
+		lutIdx, lutLeft, lutTop, applied ? 1 : 0);
+	diag_log(b);
+}
+#else
+#define DiagLogPresent(self, sc, a3, rects, n, bb, d, lutIdx, l, t, ok) ((void)0)
+#endif
+
 bool ApplyLUTDirect(void* self, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects)
 {
-	if (g_hookInert.load() || !backBuffer) return false;
+	if (g_hookInert.load() || !backBuffer)
+	{
+#if DIAG_PER_FRAME
+		DiagReason("apply", g_hookInert.load() ? "inert" : "no-backbuffer", self);
+#endif
+		return false;
+	}
 	ComPtr<ID3D11Device> dev;
 	backBuffer->GetDevice(&dev);
-	if (!dev) return false;
+	if (!dev)
+	{
+#if DIAG_PER_FRAME
+		DiagReason("apply", "GetDevice-failed", self, (unsigned long long)backBuffer);
+#endif
+		return false;
+	}
 
 	// Gate before the adapter is touched: no LUT here means no reference on this device.
-	if (!ContextHasApplicableLut(self, backBuffer)) return false;
+	if (!ContextHasApplicableLut(self, backBuffer))
+	{
+#if DIAG_PER_FRAME
+		DiagReason("apply", "no-applicable-lut", self, (unsigned long long)backBuffer);
+#endif
+		return false;
+	}
 
 	AdapterAssets* a = FindOrRequestAdapter(dev.Get());
-	if (!a) return false;
+	if (!a)
+	{
+#if DIAG_PER_FRAME
+		DiagReason("apply", "adapter-unavailable", self, (unsigned long long)dev.Get());
+#endif
+		return false;
+	}
 
 	bool result = RenderLUT_Guarded(self, backBuffer, rects, numRects, a, dev.Get());
+#if DIAG_PER_FRAME
+	if (!result) DiagReason("apply", "RenderLUT-failed", self, (unsigned long long)backBuffer);
+#endif
 	return result;
 }
 
@@ -1852,16 +2271,54 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 
 				bool success = false;
 
+#if DIAG_PER_FRAME
+				DiagForegroundWatch();   // marks Alt-Tab moments in the log timeline
+#endif
+
+				// The dirty-rect vector is DWM-provided. Guard it like every other untrusted pointer this
+				// hook touches: a NULL or torn vector must skip the frame, never fault the composition
+				// thread. RenderLUT additionally caps and sanitizes the list itself.
+				struct tagRECT* rects = NULL;
+				int numRects = 0;
+				if (rectVec != NULL && rectVec->start != NULL && rectVec->end != NULL)
+				{
+					ptrdiff_t diff = rectVec->end - rectVec->start;
+					numRects = (diff > 0 && diff < 0x40000000LL) ? (int)diff : 0;
+					rects = rectVec->start;
+				}
+
 				ID3D11Texture2D* backBuffer = GetBackBuffer_25H2(overlaySwapChain);
 				if (backBuffer)
 				{
-					if (ApplyLUTDirect(self, backBuffer, rectVec->start, (int)(rectVec->end - rectVec->start)))
+					bool applied = false;
+					if (ApplyLUTDirect(self, backBuffer, rects, numRects))
 					{
 						SetLUTActive(self);
 						success = true;
+						applied = true;
 					}
+#if DIAG_PER_FRAME
+					{
+						D3D11_TEXTURE2D_DESC d = {};
+						backBuffer->GetDesc(&d);
+						int idx = -1;
+						if (d.Format == DXGI_FORMAT_B8G8R8A8_UNORM || d.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+						    d.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || d.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+						    d.Format == DXGI_FORMAT_R10G10B10A2_UNORM) idx = 0;
+						else if (d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) idx = 1;
+						int lutIdx = -1, l = 0, t = 0;
+						if (idx >= 0) GetLUTDataFromCOverlayContext(self, idx == 1, &lutIdx, &l, &t);
+						DiagLogPresent(self, overlaySwapChain, a3, rects, numRects, backBuffer, &d, lutIdx, l, t, applied);
+					}
+#endif
 					backBuffer->Release();
 				}
+#if DIAG_PER_FRAME
+				else
+				{
+					DiagReason("present", "GetBackBuffer25H2-failed", self, (unsigned long long)overlaySwapChain);
+				}
+#endif
 
 					// NOTE: swapchain-offset scan removed. It called GetDevice on arbitrary non-swapchain
 					// pointers, which destabilized DWM composition (confirmed crash source on 26100.8246).
@@ -1913,7 +2370,16 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 						IOverlaySwapChain_IDXGISwapChain_offset);
 				}
 
-				if (swapChain != NULL && ApplyLUT(self, swapChain, rectVec->start, (int)(rectVec->end - rectVec->start)))
+				struct tagRECT* rects = NULL;
+				int numRects = 0;
+				if (rectVec != NULL && rectVec->start != NULL && rectVec->end != NULL)
+				{
+					ptrdiff_t diff = rectVec->end - rectVec->start;
+					numRects = (diff > 0 && diff < 0x40000000LL) ? (int)diff : 0;
+					rects = rectVec->start;
+				}
+
+				if (swapChain != NULL && ApplyLUT(self, swapChain, rects, numRects))
 				{
 					LOG_ONLY_ONCE("Setting LUTactive")
 					SetLUTActive(self);
@@ -1976,7 +2442,16 @@ long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned i
 					IOverlaySwapChain_IDXGISwapChain_offset);
 			}
 
-			if (ApplyLUT(self, swapChain, rectVec->start, (int)(rectVec->end - rectVec->start)))
+			struct tagRECT* rects = NULL;
+			int numRects = 0;
+			if (rectVec != NULL && rectVec->start != NULL && rectVec->end != NULL)
+			{
+				ptrdiff_t diff = rectVec->end - rectVec->start;
+				numRects = (diff > 0 && diff < 0x40000000LL) ? (int)diff : 0;
+				rects = rectVec->start;
+			}
+
+			if (ApplyLUT(self, swapChain, rects, numRects))
 			{
 				LOG_ONLY_ONCE("Setting LUTactive")
 				SetLUTActive(self);
@@ -1997,10 +2472,12 @@ CWindowContext_IsCandidateDirectFlipCompatible_t* CWindowContext_IsCandidateDire
 
 bool CWindowContext_IsCandidateDirectFlipCompatible_hook(void* self, void* a2, bool a3)
 {
+#if KEEP_CONTEXT_FLIP_SUPPRESSION
 	if (numLuts > 0)
 	{
 		return false;
 	}
+#endif
 	return CWindowContext_IsCandidateDirectFlipCompatible_orig(self, a2, a3);
 }
 
@@ -2009,10 +2486,12 @@ CCompSwapChain_IsCandidateDirectFlipCompatible_t* CCompSwapChain_IsCandidateDire
 
 bool CCompSwapChain_IsCandidateDirectFlipCompatible_hook(void* self, void* a2, bool a3)
 {
+#if KEEP_CONTEXT_FLIP_SUPPRESSION
 	if (numLuts > 0)
 	{
 		return false;
 	}
+#endif
 	return CCompSwapChain_IsCandidateDirectFlipCompatible_orig(self, a2, a3);
 }
 
@@ -2021,10 +2500,12 @@ CCompVisual_IsCandidateForPromotion_t* CCompVisual_IsCandidateForPromotion_orig 
 
 bool CCompVisual_IsCandidateForPromotion_hook(void* self, void* a2, void* a3)
 {
+#if KEEP_CONTEXT_FLIP_SUPPRESSION
 	if (numLuts > 0)
 	{
 		return false;
 	}
+#endif
 	return CCompVisual_IsCandidateForPromotion_orig(self, a2, a3);
 }
 
@@ -2033,10 +2514,12 @@ CCompSwapChain_IsCandidateIndependentFlipCompatible_t* CCompSwapChain_IsCandidat
 
 bool CCompSwapChain_IsCandidateIndependentFlipCompatible_hook(void* self)
 {
+#if KEEP_CONTEXT_FLIP_SUPPRESSION
 	if (numLuts > 0)
 	{
 		return false;
 	}
+#endif
 	return CCompSwapChain_IsCandidateIndependentFlipCompatible_orig(self);
 }
 
@@ -2050,20 +2533,24 @@ COverlayContext_IsCandidateDirectFlipCompatible_24h2_t* COverlayContext_IsCandid
 bool COverlayContext_IsCandidateDirectFlipCompatible_hook_24h2(void* self, void* a2, void* a3, void* a4, unsigned int a5,
 	bool a6)
 {
+#if KEEP_CONTEXT_FLIP_SUPPRESSION
 	if (IsLUTActive(self))
 	{
 		return false;
 	}
+#endif
 	return COverlayContext_IsCandidateDirectFlipCompatible_orig_24h2(self, a2, a3, a4, a5, a6);
 }
 
 bool COverlayContext_IsCandidateDirectFlipCompatible_hook(void* self, void* a2, void* a3, void* a4, int a5,
                                                           unsigned int a6, bool a7, bool a8)
 {
+#if KEEP_CONTEXT_FLIP_SUPPRESSION
 	if (IsLUTActive(self))
 	{
 		return false;
 	}
+#endif
 	return COverlayContext_IsCandidateDirectFlipCompatible_orig(self, a2, a3, a4, a5, a6, a7, a8);
 }
 
@@ -2090,10 +2577,12 @@ extern "C" bool OverlaysEnabled_thunk(void* self);  // register-preserving detou
 // extern "C" so the asm thunk can call it by an unmangled name.
 extern "C" bool COverlayContext_OverlaysEnabled_hook(void* self)
 {
+#if KEEP_CONTEXT_FLIP_SUPPRESSION
 	if (IsLUTActive(self))
 	{
 		return false;
 	}
+#endif
 	return COverlayContext_OverlaysEnabled_orig(self);
 }
 
