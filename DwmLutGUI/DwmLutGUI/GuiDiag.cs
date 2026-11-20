@@ -19,6 +19,42 @@ namespace DwmLutGUI
     {
         public const bool Enabled = false;
 
+        /// <summary>
+        /// Unconditional, low-volume log for the startup gamma-fix automation. GuiDiag proper is
+        /// compiled out of release builds, but "silently record why it did or did not patch" needs a
+        /// sink that survives that: a handful of lines per launch in %TEMP%\dwmlut_auto.log, capped
+        /// in size so it can never grow without bound.
+        /// </summary>
+        internal static void Auto(string message)
+        {
+            var line = "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] " + message + "\r\n";
+
+            foreach (var path in new[]
+                     {
+                         Path.Combine(Path.GetTempPath(), "dwmlut_auto.log"),
+                         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                                      "Temp", "dwmlut_auto.log")
+                     })
+            {
+                try
+                {
+                    var fi = new FileInfo(path);
+                    if (fi.Exists && fi.Length > 32768) fi.Delete();
+                    File.AppendAllText(path, line);
+                    return;
+                }
+                catch
+                {
+                    // Try the next location; diagnostics must never take the launch down.
+                }
+            }
+        }
+
+        internal static void AutoError(string what, Exception ex)
+        {
+            Auto(what + " FAILED: " + ex.GetType().Name + ": " + ex.Message);
+        }
+
         private static readonly object Lock = new object();
         private static string _path;
         private static bool _headerWritten;

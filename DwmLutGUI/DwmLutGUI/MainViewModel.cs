@@ -21,6 +21,24 @@ namespace DwmLutGUI
         private Key _toggleKey;
         private bool _autostartAsked;
 
+        // --- Startup gamma-fix automation ---
+        // Persisted in config.xml as gamma_fix_auto and default OFF, so upgrading never starts
+        // patching DWM behind the user's back. The gamma value itself is persisted too, so a launch
+        // re-applies whatever was selected last.
+        private bool _gammaFixAuto;
+        // Set for the rest of the session when the user turns the fix OFF by hand - the watcher must
+        // not immediately fight that choice by patching it back in.
+        private bool _gammaAutoSuspended;
+        // Consecutive fresh readings of a definitively unpatched DWM, required before the watcher
+        // acts: a read taken while DWM is still coming up can look unpatched, and restarting DWM on
+        // that basis would turn one lost patch into a restart loop.
+        private int _gammaAutoInactiveReads;
+        private int _gammaAutoFailedAttempts;
+        private DateTime _gammaAutoRetryAfterUtc = DateTime.MinValue;
+        private const int GammaAutoConfirmReads = 2;
+        private const int GammaAutoMaxFailedAttempts = 3;
+        private const int GammaAutoRetryBackoffMs = 60000;
+
         private readonly string _configPath;
 
         private bool _configChanged;
@@ -87,6 +105,10 @@ namespace DwmLutGUI
                 var xElem = new XElement("monitors",
                     new XAttribute("lut_toggle", _toggleKey),
                     new XAttribute("autostart_asked", _autostartAsked),
+                    // Persisted so a launch knows both whether to patch and with which exponent.
+                    new XAttribute("gamma_fix_value",
+                        Injector.GammaFixValue.ToString("0.0", CultureInfo.InvariantCulture)),
+                    new XAttribute("gamma_fix_auto", _gammaFixAuto),
                     _allMonitors
                         // an entry with no usable identity can never be matched back and would only
                         // serve to poison the writer; drop it defensively.
@@ -171,6 +193,36 @@ namespace DwmLutGUI
             get => _autostartAsked;
         }
 
+        /// <summary>
+        /// When set, the fix is enabled as soon as DwmLutGUI starts, using the gamma value selected
+        /// last. Persisted in config.xml and OFF by default so an upgrade changes nothing until the
+        /// user opts in. Each launch that actually has to patch costs one DWM restart (brief black
+        /// flash); a launch that finds the patch still live in DWM skips it.
+        /// </summary>
+        public bool GammaFixAutoEnabled
+        {
+            get => _gammaFixAuto;
+            set
+            {
+                if (_gammaFixAuto == value) return;
+                _gammaFixAuto = value;
+
+                // Switching it on is also an instruction to keep the fix alive from this point on,
+                // overriding a manual Off from earlier in the session and clearing any failure count.
+                if (value)
+                {
+                    _gammaAutoSuspended = false;
+                    _gammaAutoInactiveReads = 0;
+                    _gammaAutoFailedAttempts = 0;
+                    _gammaAutoRetryAfterUtc = DateTime.MinValue;
+                }
+
+                OnPropertyChanged();
+                SaveConfig();
+                GuiDiag.Auto("option set to " + value + " (persisted)");
+            }
+        }
+
         public bool IsActive
         {
             set
@@ -210,6 +262,8 @@ namespace DwmLutGUI
 
         public bool CanToggleAutostart => !IsBusy;
 
+        public bool CanToggleGammaFixAuto => !IsBusy;
+
         /// <summary>Set around an autostart change so the other controls gate on it.</summary>
         public bool AutostartOpInProgress
         {
@@ -228,6 +282,7 @@ namespace DwmLutGUI
             OnPropertyChanged(nameof(CanApplyLut));
             OnPropertyChanged(nameof(CanDisableLut));
             OnPropertyChanged(nameof(CanToggleAutostart));
+            OnPropertyChanged(nameof(CanToggleGammaFixAuto));
             OnPropertyChanged(nameof(CanEnableGammaFix));
             OnPropertyChanged(nameof(CanDisableGammaFix));
         }
@@ -297,6 +352,7 @@ namespace DwmLutGUI
                 if (Injector.GammaFixValue == value) return;
                 Injector.GammaFixValue = value;
                 OnPropertyChanged(nameof(SelectedGammaValue));
+                SaveConfig();   // this value is what the next launch patches with
                 GuiDiag.Log("gamma target set to " + value.ToString("0.0") +
                             (GammaFixActive ? " (fix is live - off/on required for it to take effect)" : ""));
             }
@@ -414,9 +470,30 @@ namespace DwmLutGUI
             {
                 try
                 {
-                    config = XElement.Load(_configPath).Descendants("monitor").ToList();
-                    _toggleKey = (Key)Enum.Parse(typeof(Key), (string)XElement.Load(_configPath).Attribute("lut_toggle"));
-                    _autostartAsked = (bool?)XElement.Load(_configPath).Attribute("autostart_asked") ?? false;
+                    var cfg = XElement.Load(_configPath);
+                    config = cfg.Descendants("monitor").ToList();
+                    _toggleKey = (Key)Enum.Parse(typeof(Key), (string)cfg.Attribute("lut_toggle"));
+                    _autostartAsked = (bool?)cfg.Attribute("autostart_asked") ?? false;
+
+                    // Gamma value + startup option. Old config.xml files simply lack the attributes,
+                    // so both fall back to their defaults. A value outside the offered range (or a
+                    // hand-edited NaN) is ignored rather than pushed into the patcher.
+                    var gammaValue = (double?)cfg.Attribute("gamma_fix_value");
+                    var seededGamma = Injector.GammaFixValue;
+                    if (gammaValue.HasValue && !double.IsNaN(gammaValue.Value) && !double.IsInfinity(gammaValue.Value) &&
+                        gammaValue.Value >= 1.0 && gammaValue.Value <= 4.0)
+                    {
+                        Injector.GammaFixValue = gammaValue.Value;
+                    }
+                    if (Injector.GammaFixValue != seededGamma)
+                        OnPropertyChanged(nameof(SelectedGammaValue));
+
+                    var gammaAuto = (bool?)cfg.Attribute("gamma_fix_auto") ?? false;
+                    if (_gammaFixAuto != gammaAuto)
+                    {
+                        _gammaFixAuto = gammaAuto;
+                        OnPropertyChanged(nameof(GammaFixAutoEnabled));
+                    }
                 }
                 catch
                 {
@@ -566,6 +643,10 @@ namespace DwmLutGUI
             }
 
             var lutWasActive = IsActive;
+            // A deliberate On from the user cancels a manual-Off suspension for the session.
+            _gammaAutoSuspended = false;
+            _gammaAutoFailedAttempts = 0;
+            _gammaAutoRetryAfterUtc = DateTime.MinValue;
             GammaFixEnabled = true;
             ApplyGammaFixChange(lutWasActive);
         }
@@ -580,6 +661,9 @@ namespace DwmLutGUI
             }
 
             var lutWasActive = IsActive;
+            // The startup option stays enabled (it means "enable at startup", not "keep it on"), but
+            // the watcher must not undo this manual choice by patching the fix straight back in.
+            _gammaAutoSuspended = true;
             GammaFixEnabled = false;
             ApplyGammaFixChange(lutWasActive);
         }
@@ -633,6 +717,105 @@ namespace DwmLutGUI
                 GuiDiag.Log("*** DISPLAY LOST: monitor count fell from " + monitorsBefore + " to " +
                             Monitors.Count + " across the DWM restart. Avoid further gamma toggles " +
                             "until the display configuration has recovered (reconnect the display or reboot).");
+            }
+        }
+
+        /// <summary>
+        /// Startup path for the persisted "enable automatically" option. Never shows a dialog: at
+        /// logon there may be nobody to dismiss one, and a modal here would block the launch. Any
+        /// failure is logged and left to the status line, which reads the real state out of DWM.
+        /// </summary>
+        public void AutoEnableGammaFixAtStartup()
+        {
+            if (!_gammaFixAuto)
+            {
+                GuiDiag.Auto("startup: option is off in config.xml, not patching");
+                return;
+            }
+
+            if (!CanApply)
+            {
+                GuiDiag.Auto("startup: skipped, this process cannot patch DWM (no debug privilege)");
+                return;
+            }
+
+            // A launch that finds the patch still live (GUI restarted, DWM not) must not restart DWM
+            // again: the baked exponent cannot be changed that way, so it would only cost a flash.
+            var live = Injector.GetGammaFixStatus(true);
+            if (live == true)
+            {
+                Injector.GammaFixEnabled = true;
+                GammaFixActive = true;
+                GuiDiag.Auto("startup: fix already live in DWM, skipping the patch " +
+                             "(value changes need Off/On)");
+                return;
+            }
+
+            GuiDiag.Auto("startup: patching, gamma " + Injector.GammaFixValue.ToString("0.0"));
+            try
+            {
+                GammaFixEnabled = true;
+                ApplyGammaFixChange(IsActive);
+                GuiDiag.Auto("startup: patch finished, live=" + GammaFixActive);
+            }
+            catch (Exception ex)
+            {
+                // Leave the intent off so the UI keeps telling the truth (the status probe reports
+                // what is actually in DWM, and the On button becomes available again).
+                GammaFixEnabled = false;
+                _gammaAutoFailedAttempts++;
+                GuiDiag.AutoError("startup patch", ex);
+            }
+        }
+
+        /// <summary>
+        /// Watches for the patch disappearing from DWM while the auto option is on - which happens
+        /// whenever DWM itself restarts (driver reset, display-config change, a crash). Re-patching
+        /// has to go through the same kill-and-patch sequence as the On button, so this is gated to
+        /// stay well away from restart storms: two fresh readings must agree, DWM restarts are
+        /// already rate-limited by the shared cooldown, each failure waits a minute, and after three
+        /// failures the session stops trying.
+        /// </summary>
+        private void MaybeAutoRepatchGammaFix()
+        {
+            if (!_gammaFixAuto || _gammaAutoSuspended) return;
+            if (!CanApply || IsBusy || _suppressDisplayEvents || GammaFixCoolingDown) return;
+            if (_gammaAutoFailedAttempts >= GammaAutoMaxFailedAttempts) return;
+            if (DateTime.UtcNow < _gammaAutoRetryAfterUtc) return;
+
+            // Cheap cached answer first; only pay for a fresh 4 MB read when it says "not patched".
+            if (Injector.GetGammaFixStatus(false) != false)
+            {
+                _gammaAutoInactiveReads = 0;
+                return;
+            }
+
+            // Confirm: the cache can be seconds old, and a DWM that is still starting up can read as
+            // unpatched while it is in fact about to be patched by an in-flight operation.
+            if (Injector.GetGammaFixStatus(true) != false)
+            {
+                _gammaAutoInactiveReads = 0;
+                return;
+            }
+
+            if (++_gammaAutoInactiveReads < GammaAutoConfirmReads) return;
+            _gammaAutoInactiveReads = 0;
+
+            GuiDiag.Auto("watcher: fix is gone from DWM (DWM restarted), re-patching at gamma " +
+                         Injector.GammaFixValue.ToString("0.0"));
+            try
+            {
+                GammaFixEnabled = true;
+                ApplyGammaFixChange(IsActive);
+                _gammaAutoFailedAttempts = 0;
+                GuiDiag.Auto("watcher: re-patch finished, live=" + GammaFixActive);
+            }
+            catch (Exception ex)
+            {
+                _gammaAutoFailedAttempts++;
+                _gammaAutoRetryAfterUtc = DateTime.UtcNow.AddMilliseconds(GammaAutoRetryBackoffMs);
+                GuiDiag.AutoError("watcher re-patch (attempt " + _gammaAutoFailedAttempts +
+                                  " of " + GammaAutoMaxFailedAttempts + ")", ex);
             }
         }
 
@@ -771,6 +954,15 @@ namespace DwmLutGUI
             catch (Exception ex)
             {
                 GuiDiag.LogError("DispatcherTimer_Tick/RefreshGammaGating", ex);
+            }
+
+            try
+            {
+                MaybeAutoRepatchGammaFix();
+            }
+            catch (Exception ex)
+            {
+                GuiDiag.LogError("DispatcherTimer_Tick/MaybeAutoRepatchGammaFix", ex);
             }
         }
 
