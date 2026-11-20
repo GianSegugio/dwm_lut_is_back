@@ -82,15 +82,14 @@
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
 
                     <TextBlock Grid.Row="0" Grid.Column="0" Text="{Binding GammaFixLabel}"
                                ToolTip="Replaces the piecewise sRGB curve Windows uses to map SDR content into the HDR space with a pure gamma curve. Shows a countdown while a DWM restart settles."
                                VerticalAlignment="Center" TextAlignment="Right" Margin="0,0,6,6" />
-                    <ComboBox Grid.Row="0" Grid.Column="1" Width="60" Margin="0,0,6,6"
+                    <ComboBox Grid.Row="0" Grid.Column="1" x:Name="GammaValueCombo" Width="60" Margin="0,0,6,6"
                               VerticalAlignment="Center"
-                              ItemsSource="{Binding GammaFixValues}"
-                              SelectedItem="{Binding SelectedGammaValue}"
                               ToolTip="Target gamma the piecewise sRGB curve is replaced with. 2.2 = PC/sRGB nominal, 2.4 = BT.1886 (dark room), 2.6 = DCI. If the fix is already on, switch it Off and On again for a new value to take effect." />
                     <Button Grid.Row="0" Grid.Column="2" Content="On" Width="75"
                             Margin="0,0,6,6" IsEnabled="{Binding CanEnableGammaFix}" Click="GammaFixOn_Click"
@@ -108,6 +107,12 @@
                     <Button Grid.Row="1" Grid.Column="3" Content="Disable" Width="75"
                             IsEnabled="{Binding CanDisableLut}" Click="Disable_Click"
                             ToolTip="Unload from DWM and stop applying LUTs. Does not affect the HDR gamma fix, which has its own Off button." />
+
+                    <CheckBox Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="4" HorizontalAlignment="Right"
+                              Margin="0,4,0,0" Content="Enable HDR gamma fix automatically at startup"
+                              IsChecked="{Binding GammaFixAutoEnabled}"
+                              IsEnabled="{Binding CanToggleGammaFixAuto}"
+                              ToolTip="When ticked, the gamma fix is turned on as soon as DwmLutGUI starts, using the gamma value selected here. That costs one brief DWM restart (black flash) per launch that has to patch - at logon that is the ~1 second of black. A launch that finds the patch already live skips it, and turning the fix Off by hand keeps it off until the next launch. Saved in config.xml." />
                 </Grid>
             </Grid>
 

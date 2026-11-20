@@ -154,6 +154,19 @@ namespace DwmLutGUI
                 _viewModel = (MainViewModel)DataContext;
                 _applyOnCooldown = false;
 
+                // Runs before the -apply flag on purpose: patching the gamma curve restarts DWM, so
+                // doing it first means the LUTs are then injected into the DWM that survives - one
+                // black flash per launch instead of two. Silently does nothing when the option is
+                // off or when DWM already carries the patch (a fresh GUI over a live DWM).
+                try
+                {
+                    _viewModel.AutoEnableGammaFixAtStartup();
+                }
+                catch (Exception ex)
+                {
+                    GuiDiag.LogError("startup auto gamma fix", ex);
+                }
+
                 if (ProcessArguments(args, true)) return;
 
                 var notifyIcon = new NotifyIcon();
@@ -229,6 +242,20 @@ namespace DwmLutGUI
                 // so the current key wouldn't display. Re-assert it now that the items are present (shows
                 // the actual key, or "None" when no hotkey is set, instead of a blank box).
                 ToggleKeyCombo.SelectedItem = _viewModel.ToggleKey;
+
+                // Same reason, but here a spurious write is destructive: a ComboBox whose SelectedItem
+                // arrived before its items gets reset to the first item, and the TwoWay binding then
+                // writes that back through SelectedGammaValue - which persists it - silently
+                // overwriting the gamma value chosen last with 2.2 on every launch. Giving the items
+                // source in code, before the selection, removes the race entirely.
+                // No SelectedItem binding on purpose. WPF resets a ComboBox whose selection arrived
+                // before its items to the first item, and a TwoWay binding then writes that back -
+                // which persists 2.2 over whatever the user last chose, on every launch. The sync
+                // below is one-way, and only a real dropdown interaction writes to the model.
+                GammaValueCombo.ItemsSource = _viewModel.GammaFixValues;
+                SyncGammaComboFromModel();
+                GammaValueCombo.DropDownClosed += GammaValueCombo_DropDownClosed;
+                Loaded += delegate { SyncGammaComboFromModel(); };
 
                 Closing += MainWindow_Closing;
 
@@ -620,6 +647,40 @@ namespace DwmLutGUI
                 }
                 catch { }
             });
+        }
+
+        /// <summary>
+        /// Pushes the persisted gamma value into the dropdown without letting WPF's own selection
+        /// bookkeeping write anything back (hence no SelectedItem binding).
+        /// </summary>
+        private void SyncGammaComboFromModel()
+        {
+            var value = _viewModel.SelectedGammaValue;
+            if (GammaValueCombo.ItemsSource == null)
+            {
+                GammaValueCombo.ItemsSource = _viewModel.GammaFixValues;
+            }
+
+            GammaValueCombo.SelectedItem = value;
+
+            // The first item is what WPF tends to fall back to when a selection can't be resolved;
+            // if it did that, the value on screen would disagree with the value that will be applied.
+            if (!Equals(GammaValueCombo.SelectedItem, value))
+            {
+                GuiDiag.Log("gamma dropdown could not display " + value.ToString("0.0"));
+            }
+        }
+
+        /// <summary>
+        /// Persists a gamma value the user actually picked. A closed dropdown never changes on its
+        /// own, so this is the only write-back path.
+        /// </summary>
+        private void GammaValueCombo_DropDownClosed(object sender, EventArgs e)
+        {
+            if (GammaValueCombo.SelectedItem is double picked)
+            {
+                _viewModel.SelectedGammaValue = picked;
+            }
         }
 
         private void GammaFixOn_Click(object sender, RoutedEventArgs e)
